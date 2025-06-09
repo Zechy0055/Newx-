@@ -1,46 +1,51 @@
-"""
-Values of global configuration variables.
+"""Global configuration variables for the AutoCodeRover application.
+
+This module defines various settings that control the behavior of the application,
+including model selection, feature flags for debugging and validation, and
+operational parameters like retry limits and timeouts.
 """
 
-# Overall output directory for results
 output_dir: str = ""
+"""str: The root directory where all experiment results, logs, and patches are saved."""
 
-# Max number of times context retrieval and all is tried
 overall_retry_limit: int = 3
+"""int: Maximum number of times the main workflow (including context retrieval, patch generation, etc.) is retried for a task."""
 
-# upper bound of the number of conversation rounds for the agent
 conv_round_limit: int = 15
+"""int: Upper bound for the number of conversation rounds allowed between the user/system and the LLM agent."""
 
-# whether to perform sbfl
 enable_sbfl: bool = False
+"""bool: Flag to enable Spectrum-Based Fault Localization (SBFL)."""
 
-# whether to perform our own validation
 enable_validation: bool = False
+"""bool: Flag to enable the validation of generated patches against the project's test suite."""
 
-# whether to do angelic debugging
 enable_angelic: bool = False
+"""bool: Flag to enable experimental angelic debugging, which may use heuristics or weaker checks."""
 
-# whether to do perfect angelic debugging
 enable_perfect_angelic: bool = False
+"""bool: Flag to enable experimental perfect angelic debugging, which typically compares generated patches against developer patches. Overrides `enable_angelic` if both are true."""
 
-
-# A special mode to only save SBFL result and exit
 only_save_sbfl_result: bool = False
+"""bool: If True, the application will only run SBFL, save its results, and then exit. Useful for pre-calculating SBFL data."""
 
-# A special mode to only generate reproducer tests and exit
 only_reproduce: bool = False
+"""bool: If True, the application will only attempt to generate a reproducer test for the issue and then exit."""
 
-# A special mode to only evaluate a reproducer test
 only_eval_reproducer: bool = False
+"""bool: If True, the application will only evaluate an existing reproducer test and then exit."""
 
-# Experimental mode to add reproducer and reviewer into the workflow
 reproduce_and_review: bool = False
+"""bool: Experimental flag to integrate reproducer generation and patch review into the main workflow."""
 
-# timeout for test cmd execution, currently set to 5 min
 test_exec_timeout: int = 300
+"""int: Timeout in seconds for executing test commands (e.g., running a project's test suite). Default is 5 minutes."""
 
 models: list[str] = []
+"""list[str]: A list of primary model names to be used for generation tasks. The application may cycle through these if retries occur."""
 
-backup_model = ["gpt-4o-2024-05-13"]
+backup_model: list[str] = ["gpt-4o-2024-05-13"]
+"""list[str]: A list of backup model names to be used if primary models fail (e.g., due to content policy violations)."""
 
 disable_angelic: bool = False
+"""bool: (Potentially deprecated or conflicting, see `enable_angelic` and `enable_perfect_angelic`) General flag to disable angelic debugging features."""

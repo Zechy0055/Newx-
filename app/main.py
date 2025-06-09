@@ -34,8 +34,62 @@ from app.post_process import (
 from app.raw_tasks import RawGithubTask, RawLocalTask, RawSweTask, RawTask
 from app.task import SweTask, Task
 
+# Imports for FastAPI endpoint
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
+from typing import Optional, Any, Dict
+
+# FastAPI app instance
+# This should ideally be in a dedicated server setup file, but adding here as per prompt.
+# If an 'app' instance already exists for other API routes, use that.
+# For now, assume we are defining it here.
+app = FastAPI()
+
+# Pydantic model for frontend log payload
+class FrontendLogPayload(BaseModel):
+    level: str # DEBUG, INFO, WARNING, ERROR
+    message: str
+    component: Optional[str] = None
+    function: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+    frontend_timestamp: Optional[str] = None
+
+@app.post("/api/log_frontend_event")
+async def log_frontend_event(payload: FrontendLogPayload, request: Request):
+    client_host = request.client.host if request.client else "unknown"
+    log_context = {
+        "client_host": client_host,
+        "frontend_component": payload.component,
+        "frontend_function": payload.function,
+        "frontend_timestamp": payload.frontend_timestamp,
+        **(payload.context or {}) # Spread any additional context from frontend
+    }
+
+    # Use a bound logger for cleaner log structure
+    bound_logger = logger.bind(**{k: v for k, v in log_context.items() if v is not None})
+
+    level_upper = payload.level.upper()
+    if level_upper == "DEBUG":
+        bound_logger.debug("[FRONTEND] " + payload.message)
+    elif level_upper == "INFO":
+        bound_logger.info("[FRONTEND] " + payload.message)
+    elif level_upper == "WARNING":
+        bound_logger.warning("[FRONTEND] " + payload.message)
+    elif level_upper == "ERROR":
+        bound_logger.error("[FRONTEND] " + payload.message)
+    else:
+        bound_logger.warning(f"[FRONTEND] Unknown log level '{payload.level}': {payload.message}") # Log as warning if level is unknown
+
+    return {"status": "Log received"}
+
 
 def main():
+    # NOTE: The FastAPI app instance 'app' is defined above.
+    # To run this FastAPI app, a Uvicorn server would typically be used, e.g.:
+    # uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload
+    # The existing if __name__ == "__main__": block below handles CLI execution.
+    # The two (CLI and Server) would usually be run as separate processes or managed by a process manager.
+
     register_all_models()
     parser = ArgumentParser()
 
@@ -91,6 +145,7 @@ def main():
 
     # FIXME: make temperature part of the Model class
     common.MODEL_TEMP = args.model_temperature
+    logger.info("Set model temperature to: {}", common.MODEL_TEMP)
 
     # acr related
     config.conv_round_limit = args.conv_round_limit
@@ -104,7 +159,7 @@ def main():
     subcommand = getattr(args, subparser_dest_attr_name)
     if subcommand == "swe-bench":
         if args.result_analysis:
-            # do analysis and exit
+            logger.info("Starting result analysis for directory: {}", config.output_dir)
             result_analysis.analyze(config.output_dir)
             exit(0)
 
@@ -147,8 +202,10 @@ def main():
         groups = {"local": [task]}
         run_task_groups(groups, num_processes)
     elif subcommand == "extract-patches":
+        logger.info("Extracting patches from: {}", args.experiment_dir)
         extract_organize_and_form_input(args.experiment_dir)
     elif subcommand == "re-extract-patches":
+        logger.info("Re-extracting patches from: {}", args.experiment_dir)
         reextract_organize_and_form_inputs(args.experiment_dir)
 
 
@@ -309,14 +366,18 @@ def make_swe_tasks(
     tasks_map_file: str,
 ) -> list[RawSweTask]:
     if task_id is not None and task_list_file is not None:
+        logger.error("Cannot specify both --task and --task-list-file simultaneously.")
         raise ValueError("Cannot specify both task and task-list.")
 
     all_task_ids = []
     if task_list_file is not None:
         all_task_ids = parse_task_list_file(task_list_file)
+        logger.info("Loaded {} task IDs from task list file: {}", len(all_task_ids), task_list_file)
     if task_id is not None:
         all_task_ids = [task_id]
+        logger.info("Running for single task ID: {}", task_id)
     if len(all_task_ids) == 0:
+        logger.error("No task IDs provided to run.")
         raise ValueError("No task ids to run.")
 
     with open(setup_map_file) as f:
@@ -330,15 +391,12 @@ def make_swe_tasks(
         x for x in all_task_ids if not (x in setup_map and x in tasks_map)
     ]
     if missing_task_ids:
-        # Log the tasks that are not in the setup or tasks map
-        for task_id in sorted(missing_task_ids):
-            log.print_with_time(
-                f"Skipping task {task_id} which was not found in setup or tasks map."
-            )
-        # And drop them from the list of all task ids
-        all_task_ids = filter(lambda x: x not in missing_task_ids, all_task_ids)
+        for task_id_missing in sorted(missing_task_ids): # Renamed task_id to avoid conflict
+            logger.warning("Skipping task {} which was not found in setup_map or tasks_map.", task_id_missing)
+        all_task_ids = [tid for tid in all_task_ids if tid not in missing_task_ids] # Corrected filter
 
     all_task_ids = sorted(all_task_ids)
+    logger.debug("Final list of task IDs to process: {}", all_task_ids)
 
     # for each task in the list to run, create a Task instance
     all_tasks = []
@@ -383,30 +441,28 @@ def run_task_groups(
 
     task_counter.init_total_num_tasks(num_tasks)
 
-    # print some info about task
-    log.print_with_time(f"Total number of tasks: {num_tasks}")
-    log.print_with_time(f"Total number of processes: {num_processes}")
-    log.print_with_time(f"Task group info: (number of groups: {len(task_groups)})")
-    for key, tasks in task_groups.items():
-        log.print_with_time(f"\t{key}: {len(tasks)} tasks")
+    logger.info("Total number of tasks: {}", num_tasks)
+    logger.info("Total number of processes: {}", num_processes)
+    logger.info("Task group info: (number of groups: {})", len(task_groups))
+    for key, tasks_in_group in task_groups.items(): # Renamed tasks to avoid conflict
+        logger.info("\tGroup '{}': {} tasks", key, len(tasks_in_group))
 
     # single process mode
     if num_processes == 1:
-        log.print_with_time("Running in single process mode.")
+        logger.info("Running in single process mode.")
         run_tasks_serial(all_tasks)
-        log.print_with_time("Finished all tasks sequentially.")
+        logger.info("Finished all tasks sequentially.")
     else:
         run_task_groups_parallel(task_groups, num_processes)
 
     if config.only_save_sbfl_result:
-        log.print_with_time("Only saving SBFL results. Exiting.")
+        logger.info("Only saving SBFL results. Exiting.")
         return
 
     if organize_output:
-        # post-process completed experiments to get input file to SWE-bench
-        log.print_with_time("Post-processing completed experiment results.")
+        logger.info("Post-processing completed experiment results.")
         swe_input_file = organize_and_form_input(config.output_dir)
-        log.print_with_time(f"SWE-Bench input file created: {swe_input_file}")
+        logger.info("SWE-Bench input file created: {}", swe_input_file)
 
 
 def run_tasks_serial(tasks: list[RawTask]) -> None:
@@ -427,7 +483,7 @@ def run_task_groups_parallel(
         key=lambda x: len(x[1]),
         reverse=True,
     )
-    log.print_with_time(f"Sorted task groups: {[x[0] for x in task_group_ids_items]}")
+    logger.info("Sorted task groups for parallel execution: {}", [x[0] for x in task_group_ids_items])
     try:
         # Use ProcessPoolExecutor instead of multiprocessing.Pool,
         # to support nested sub-processing
@@ -436,7 +492,7 @@ def run_task_groups_parallel(
         with ProcessPoolExecutor(num_processes) as executor:
             executor.map(run_task_group, group_ids, group_tasks)
     finally:
-        log.print_with_time("Finishing all tasks in the pool.")
+        logger.info("Finishing all tasks in the pool.")
 
 
 def run_task_group(task_group_id: str, task_group_items: list[RawTask]) -> None:
@@ -444,17 +500,15 @@ def run_task_group(task_group_id: str, task_group_items: list[RawTask]) -> None:
     Run all tasks in a task group sequentially.
     Main entry to parallel processing.
     """
-    log.print_with_time(
-        f"Starting process for task group {task_group_id}. Number of tasks: {len(task_group_items)}."
-    )
-    for task in task_group_items:
-        # within a group, the runs are always sequential
-        run_task_in_subprocess(task)
-        log.print_with_time(task_counter.incre_task_return_msg())
+    bound_logger = logger.bind(task_group_id=task_group_id, process_type="task_group_runner")
+    bound_logger.info("Starting process for task group. Number of tasks: {}.", len(task_group_items))
 
-    log.print_with_time(
-        f"{task_counter.incre_task_group_return_msg()} Finished task group {task_group_id}."
-    )
+    for task_item in task_group_items: # Renamed task to avoid conflict
+        # within a group, the runs are always sequential
+        run_task_in_subprocess(task_item) # This will eventually call run_raw_task which logs with task_id
+        bound_logger.info(task_counter.incre_task_return_msg()) # This message is dynamic
+
+    bound_logger.info("{} Finished task group.", task_counter.incre_task_group_return_msg())
 
 
 def run_task_in_subprocess(task: RawTask) -> None:
@@ -498,9 +552,13 @@ def run_raw_task(task: RawTask) -> bool:
         else:
             run_status_message = f"Task {task_id} failed without exception."
     except Exception as e:
-        logger.exception(e)
-        run_status_message = f"Task {task_id} failed with exception: {e}."
+        # logger.exception(e) is good, but binding task_id provides more context
+        logger.bind(task_id=task_id).exception("Task failed with an unhandled exception.")
+        # The original exception string is included by logger.exception
+        run_status_message = f"Task {task_id} failed with exception: {type(e).__name__}."
 
+    # log_and_always_print already uses logger.info, so the message will go to JSON.
+    # The console output has its own timestamp.
     log.log_and_always_print(run_status_message)
 
     final_patch_path = get_final_patch_path(task_output_dir)
@@ -569,6 +627,12 @@ def do_inference(python_task: Task, task_output_dir: str) -> bool:
             " | <level>{message}</level>"
         ),
     )
+    # Add new sink for JSON logging
+    logger.add(
+        pjoin(task_output_dir, "json_info.log"),
+        level="DEBUG",
+        serialize=True, # Enable JSON output
+    )
 
     start_time = datetime.now()
 
@@ -588,24 +652,31 @@ def do_inference(python_task: Task, task_output_dir: str) -> bool:
 
             try:
                 run_ok = inference.run_one_task(
-                    python_task, task_output_dir, config.models
+                    python_task, task_output_dir, config.models # run_one_task in inference.py logs with task_id
                 )
 
-            except common.ClaudeContentPolicyViolation:
+            except common.ClaudeContentPolicyViolation as e:
+                logger.bind(task_id=python_task.get_instance_id()).error(f"Content policy violation from Claude: {e}", exc_info=True)
+                # log_and_always_print already uses logger.info
                 log.log_and_always_print(
-                    "Content policy violation. Retry with backup model."
+                    "Content policy violation. Trying with backup model if configured."
                 )
 
-                # retry with backup model
-                python_task.setup_project()
+                if not config.backup_model:
+                    logger.bind(task_id=python_task.get_instance_id()).error("No backup model configured. Cannot retry.")
+                    run_ok = False # Ensure run_ok is False
+                    # Potentially re-raise or handle as a definitive failure for this task
+                else:
+                    # retry with backup model
+                    python_task.setup_project() # This might log internally
 
-                # remove everything other than the info.log file, and
-                # also some meta data file dumped by RawTask
-                log.log_and_always_print(
-                    "Removing all files except info.log and meta files."
-                )
-
-                for f in Path(task_output_dir).iterdir():
+                    # remove everything other than the info.log file, and
+                    # also some meta data file dumped by RawTask
+                    log.log_and_always_print( # This logs via logger.info
+                        "Removing intermediate files except logs and meta files before retrying with backup model."
+                    )
+                    logger.bind(task_id=python_task.get_instance_id()).debug("Starting file cleanup for retry.")
+                    for f in Path(task_output_dir).iterdir():
                     if f.is_file() and f.name not in [
                         log_file_name,
                         "meta.json",

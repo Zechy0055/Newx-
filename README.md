@@ -38,7 +38,7 @@
 
 ## 👋 Overview
 
-AutoCodeRover is a fully automated approach for resolving GitHub issues (bug fixing and feature addition) where LLMs are combined with analysis and debugging capabilities to prioritize patch locations ultimately leading to a patch.
+AutoCodeRover is a system designed to automate software engineering tasks, particularly fixing bugs and implementing features based on issue descriptions. It leverages Large Language Models (LLMs) combined with program analysis, code search, and debugging capabilities to understand issues, retrieve relevant context from code repositories, and generate patches. The system can operate on SWE-bench tasks, live GitHub issues, or local projects, and includes a frontend visualization component to display the agent's actions and reasoning process.
 
 [Update on June 20, 2024] AutoCodeRover(v20240620) now resolves **30.67%** of issues (pass@1) in SWE-bench lite! AutoCodeRover achieved this efficacy while being economical - each task costs **less than $0.7** and is completed within **7 mins**!
 
@@ -61,6 +61,44 @@ AutoCodeRover has two unique features:
 
 - Code search APIs are *Program Structure Aware*. Instead of searching over files by plain string matching, AutoCodeRover searches for relevant code context (methods/classes) in the abstract syntax tree.
 - When a test suite is available, AutoCodeRover can take advantage of test cases to achieve an even higher repair rate, by performing *statistical fault localization*.
+
+## ✨ Key Features
+
+*   **Automated Issue Resolution:** Addresses bugs and implements features described in issue reports.
+*   **SWE-bench Integration:** Supports running and evaluating on SWE-bench tasks.
+*   **GitHub & Local Issue Processing:** Can work with live GitHub issues or local codebases and issue descriptions.
+*   **Advanced Context Retrieval:** Employs program structure-aware code search APIs to find relevant code context.
+*   **LLM-Powered Patch Generation:** Uses Large Language Models to generate code patches.
+*   **Interactive Frontend Visualization:** A Next.js application (`demo_vis/front`) to visualize the agent's workflow and messages.
+*   **Structured Logging:** Comprehensive backend logging with `loguru` (including per-task JSON logs) and frontend logging to a backend endpoint.
+*   **Modular Agent Architecture:** Comprises specialized agents for different tasks (context retrieval, patch writing, review, etc.).
+*   **Support for Multiple LLMs:** Compatible with various models from OpenAI, Anthropic, Google (via LiteLLM), and local models via Ollama/Groq.
+
+## 🏗️ Architecture Overview
+
+AutoCodeRover consists of the following main components:
+
+*   **Backend (Python, FastAPI):**
+    *   Handles the core logic for task execution, including parsing issues, interacting with Git repositories, and managing the agent workflow.
+    *   Contains the specialized agents for different software engineering sub-tasks.
+    *   Exposes an API (e.g., for stream-based updates for the frontend, receiving frontend logs). The FastAPI app instance is defined in `app/main.py`.
+*   **Frontend (Next.js, TypeScript):**
+    *   Located in `demo_vis/front/`.
+    *   Provides a web interface to input task details (e.g., GitHub issue links).
+    *   Visualizes the step-by-step actions and reasoning of the backend agents as they work on a task.
+*   **Agents (`app/agents/`):**
+    *   A collection of specialized Python modules that use LLMs and other tools to perform specific actions:
+        *   `ContextRetrievalAgent`: Searches the codebase to find relevant context for an issue.
+        *   `PatchAgent`: Generates code patches based on the issue and retrieved context.
+        *   `TestAgent`: Attempts to generate reproducing tests for issues.
+        *   `ReviewAgent`: (Experimental) Reviews generated patches and tests.
+
+**Interaction Flow (High-Level for Demo Visualization):**
+1.  User submits an issue via the Frontend.
+2.  Frontend sends the task details to the Backend API (e.g., `/api/run_github_issue`).
+3.  Backend processes the task, invoking various agents in sequence.
+4.  Agents stream messages/updates back to the Frontend, which displays them in real-time.
+5.  Frontend sends its own log events (UI interactions, errors) to a separate Backend API endpoint (`/api/log_frontend_event`) for centralized logging.
 
 ## 🗎 arXiv Paper
 ### AutoCodeRover: Autonomous Program Improvement [[arXiv 2404.05427]](https://arxiv.org/abs/2404.05427)
@@ -105,9 +143,87 @@ https://github.com/nus-apr/auto-code-rover/assets/48704330/26c9d5d4-04e0-4b98-be
 
 ## 🚀 Setup & Running
 
-### Setup API key and environment
+### Prerequisites
 
-We recommend running AutoCodeRover in a Docker container.
+*   **Python:** Version 3.9 or higher.
+*   **Conda (Recommended):** For managing Python environments.
+*   **Node.js and npm (or yarn):** For the frontend development server.
+*   **Docker (Recommended for backend):** For running the backend in a containerized environment, especially for SWE-bench tasks. The provided `Dockerfile.minimal` is a good starting point.
+*   **Git:** For cloning repositories.
+
+### Backend Setup
+
+1.  **Clone the Repository:**
+    ```bash
+    git clone https://github.com/nus-apr/auto-code-rover.git
+    cd auto-code-rover
+    ```
+
+2.  **Set up Python Environment (Conda Recommended):**
+    ```bash
+    conda env create -f environment.yml
+    conda activate auto-code-rover
+    ```
+    Alternatively, create a virtual environment and install dependencies:
+    ```bash
+    python -m venv .venv
+    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+    pip install -r requirements.txt
+    ```
+
+3.  **API Keys & Configuration:**
+    Set the necessary API keys as environment variables. For example:
+    ```bash
+    export OPENAI_KEY="sk-YOUR-OPENAI-API-KEY-HERE"
+    export ANTHROPIC_API_KEY="sk-ant-api..."
+    # Add other keys (e.g., GROQ_API_KEY) as needed.
+    ```
+    Refer to `app/config.py` for other configuration variables that can be adjusted. These are typically set via command-line arguments when running tasks (see below).
+
+### Frontend Setup
+
+1.  **Navigate to the frontend directory:**
+    ```bash
+    cd demo_vis/front
+    ```
+2.  **Install dependencies:**
+    ```bash
+    npm install
+    # or
+    # yarn install
+    ```
+
+### Running the Application
+
+**1. Backend Server (for Demo UI & API):**
+
+The backend includes a FastAPI application defined in `app/main.py`. To run this server for the frontend visualization and API endpoints (like frontend logging):
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload
+```
+This makes the backend API (including `/api/run_github_issue` and `/api/log_frontend_event`) available at `http://localhost:5000`.
+
+**2. Backend for CLI Tasks (e.g., SWE-bench, specific issue processing):**
+
+Use the command-line interface as described in the sections below (e.g., "GitHub issue mode", "Local issue mode", "SWE-bench mode"). These commands directly run the task processing logic.
+Example:
+```bash
+PYTHONPATH=. python app/main.py github-issue --output-dir output --setup-dir setup --model gpt-4o-2024-05-13 --task-id my-test-issue --clone-link <repo_link> --commit-hash <hash> --issue-link <issue_link>
+```
+
+**3. Frontend Development Server:**
+
+Navigate to the frontend directory and run:
+```bash
+cd demo_vis/front
+npm run dev
+```
+The frontend will typically be accessible at `http://localhost:3000`. Ensure the backend server (FastAPI/Uvicorn) is running and accessible to the frontend, usually at `http://localhost:5000`.
+
+
+### Original Setup API key and environment (Primarily for Docker/CLI execution)
+
+We recommend running AutoCodeRover in a Docker container for CLI tasks.
 
 Set the `OPENAI_KEY` env var to your [OpenAI key](https://help.openai.com/en/articles/4936850-where-do-i-find-my-openai-api-key):
 
@@ -338,9 +454,45 @@ The current list of supported models:
 
 Please refer to [EXPERIMENT.md](EXPERIMENT.md) for information on experiment replication.
 
+## 🪵 Logging System
+
+AutoCodeRover employs a comprehensive logging system:
+
+*   **Backend:**
+    *   Uses `loguru` for flexible and powerful logging.
+    *   For each task run via `app/main.py` CLI, two main log files are generated in the task-specific output directory (e.g., `output_dir/[task_id_timestamp]/`):
+        *   `info.log`: Text-based log with detailed debug information and formatted messages.
+        *   `json_info.log`: Structured JSON log containing all log records with levels, timestamps, messages, and bound contextual data (e.g., `task_id`, `agent_name`, `component`). This is useful for programmatic analysis of agent behavior.
+    *   Console output is also provided, often using `rich` for better readability, and its verbosity can be controlled. Custom panel prints (e.g., for ACR messages, retrieval results) also route a structured version of their content to the file logs.
+
+*   **Frontend:**
+    *   User interactions, stream processing events, and errors in the frontend (`demo_vis/front/app/page.tsx`) are logged.
+    *   A `logToBackend` utility function sends these logs (level, message, component, function, context, frontend_timestamp) to the `/api/log_frontend_event` endpoint on the backend.
+    *   The backend then records these frontend events into its standard logging system (including the per-task `json_info.log`), allowing for centralized analysis of both frontend and backend activity.
+
+##  주요 모듈 (Key Modules - Backend)
+
+*   **`app/main.py`**: Entry point for CLI operations and definition of the FastAPI application for API services.
+*   **`app/config.py`**: Global configuration variables.
+*   **`app/log.py`**: Logging utilities and rich console printing functions.
+*   **`app/data_structures.py`**: Core data classes used across the application.
+*   **`app/agents/`**: Directory containing the logic for different specialized agents (e.g., `PatchAgent`, `TestAgent`, `ReviewAgent`).
+*   **`app/api/`**: Modules related to backend API logic, evaluation helpers, and validation.
+*   **`app/inference.py`**: Manages the overall workflow for running a task with agents.
+*   **`demo_vis/`**: Contains the frontend application (`demo_vis/front`) and potentially backend scripts specific to running the demo.
+
 ## Testing
 
 Please refer to [TESTING.md](TESTING.md) for information on setting up and running tests.
+
+## 🤝 Contributing
+
+Contributions are welcome! If you'd like to contribute, please feel free to fork the repository, make your changes, and submit a pull request. For major changes, please open an issue first to discuss what you would like to change.
+You can also join our [Discord server](https://discord.gg/ScXsdE49JY) for discussions.
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## ✉️ Contacts
 

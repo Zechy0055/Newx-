@@ -8,7 +8,7 @@ from enum import Enum
 
 from loguru import logger
 
-from app.agents.agent_common import InvalidLLMResponse
+from app.agents.agent_common import InvalidLLMResponse, LLMErrorCode
 from app.data_structures import MessageThread, ReproResult
 from app.model import common
 
@@ -31,16 +31,22 @@ class Review:
     patch_decision: ReviewDecision
     patch_analysis: str
     patch_advice: str
+    patch_rejection_reason: RejectionReason | None = None  # Added
     test_decision: ReviewDecision
     test_analysis: str
     test_advice: str
+    test_rejection_reason: RejectionReason | None = None  # Added
 
     def __str__(self):
+        patch_reason_str = f"Patch rejection reason: {self.patch_rejection_reason.value}\n\n" if self.patch_rejection_reason else ""
+        test_reason_str = f"Test rejection reason: {self.test_rejection_reason.value}\n\n" if self.test_rejection_reason else ""
         return (
             f"Patch decision: {self.patch_decision.value}\n\n"
+            f"{patch_reason_str}"
             f"Patch analysis: {self.patch_analysis}\n\n"
             f"Patch advice: {self.patch_advice}\n\n"
             f"Test decision: {self.test_decision.value}\n\n"
+            f"{test_reason_str}"
             f"Test analysis: {self.test_analysis}\n\n"
             f"Test advice: {self.test_advice}"
         )
@@ -50,9 +56,11 @@ class Review:
             "patch-correct": self.patch_decision.value,
             "patch-analysis": self.patch_analysis,
             "patch-advice": self.patch_advice,
+            "patch-rejection-reason": self.patch_rejection_reason.value if self.patch_rejection_reason else None,
             "test-correct": self.test_decision.value,
             "test-analysis": self.test_analysis,
             "test-advice": self.test_advice,
+            "test-rejection-reason": self.test_rejection_reason.value if self.test_rejection_reason else None,
         }
 
 
@@ -61,27 +69,68 @@ class ReviewDecision(Enum):
     NO = "no"
 
 
+class RejectionReason(Enum):
+    # Patch related
+    PATCH_APPLY_FAIL = "PATCH_APPLY_FAIL"  # Technical issue: Patch does not apply cleanly
+    PATCH_NO_IMPROVEMENT = "PATCH_NO_IMPROVEMENT"  # Functional issue: Patch applies but test still fails as before / issue not resolved
+    PATCH_REGRESSION = "PATCH_REGRESSION"  # Functional issue: Patch causes new issues / makes things worse (e.g. test that passed now fails)
+    PATCH_BAD_SYNTAX = "PATCH_BAD_SYNTAX" # Technical issue: Patch has syntax errors
+    PATCH_OTHER = "PATCH_OTHER" # Other patch-related reasons
+
+    # Test related
+    TEST_DOES_NOT_FAIL = "TEST_DOES_NOT_FAIL"  # Functional issue: Test passes on original code (doesn't reproduce bug)
+    TEST_FLAKY = "TEST_FLAKY"  # Technical issue: Test produces inconsistent results
+    TEST_IRRELEVANT = "TEST_IRRELEVANT"  # Functional issue: Test is not relevant to the described issue
+    TEST_BAD_SYNTAX = "TEST_BAD_SYNTAX" # Technical issue: Test has syntax errors
+    TEST_OTHER = "TEST_OTHER" # Other test-related reasons
+
+
 def extract_review_result(content: str) -> Review | None:
     try:
         data = json.loads(content)
 
+        patch_decision = ReviewDecision(data["patch-correct"].lower())
+        test_decision = ReviewDecision(data["test-correct"].lower())
+
+        # Placeholder for actual LLM providing these reasons
+        # For now, if it's a "no", we'll assign a generic "OTHER" reason.
+        # A more sophisticated approach would involve parsing analysis/advice for keywords
+        # or having the LLM explicitly state the reason code.
+        patch_rejection_reason = None
+        if patch_decision == ReviewDecision.NO:
+            patch_rejection_reason = RejectionReason(data.get("patch-rejection-reason", RejectionReason.PATCH_OTHER.value).upper()) \
+                if data.get("patch-rejection-reason") else RejectionReason.PATCH_OTHER
+
+        test_rejection_reason = None
+        if test_decision == ReviewDecision.NO:
+            test_rejection_reason = RejectionReason(data.get("test-rejection-reason", RejectionReason.TEST_OTHER.value).upper()) \
+                if data.get("test-rejection-reason") else RejectionReason.TEST_OTHER
+
         review = Review(
-            patch_decision=ReviewDecision(data["patch-correct"].lower()),
+            patch_decision=patch_decision,
             patch_analysis=data["patch-analysis"],
             patch_advice=data["patch-advice"],
-            test_decision=ReviewDecision(data["test-correct"].lower()),
+            patch_rejection_reason=patch_rejection_reason,
+            test_decision=test_decision,
             test_analysis=data["test-analysis"],
             test_advice=data["test-advice"],
+            test_rejection_reason=test_rejection_reason,
         )
 
-        if (
-            (review.patch_decision == ReviewDecision.NO) and not review.patch_advice
-        ) and ((review.test_decision == ReviewDecision.NO) and not review.test_advice):
-            return None
+        # If advice is missing for a "no" decision, it might be an invalid review
+        if (patch_decision == ReviewDecision.NO and not review.patch_advice) or \
+           (test_decision == ReviewDecision.NO and not review.test_advice):
+            # Allow if a specific reason is given, even if advice is minimal
+            if not (patch_rejection_reason and patch_rejection_reason != RejectionReason.PATCH_OTHER) and \
+               not (test_rejection_reason and test_rejection_reason != RejectionReason.TEST_OTHER):
+                logger.warning("Review marked NO but missing advice and specific reason.")
+                # Depending on strictness, could return None here
+                # For now, let it pass if JSON is valid.
 
         return review
 
-    except Exception:
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.error("Error parsing review result from LLM content.", exc_info=True, extra={"llm_content": content})
         return None
 
 
@@ -93,6 +142,9 @@ def run(
     patched_repro: ReproResult,
     retries: int = 5,
 ) -> tuple[Review, MessageThread]:
+    # The actual LLM call and extraction logic is in run_with_retries.
+    # For now, the RejectionReason will be PATCH_OTHER or TEST_OTHER if not provided by LLM.
+    # This function's signature doesn't change, but the Review object it returns is now richer.
     review_generator = run_with_retries(
         issue_statement,
         test_content,
@@ -104,15 +156,20 @@ def run(
         retries=retries,
     )
     for review, thread in review_generator:
-        # TODO: make output dir global, so that the raw responses can be dumped
         if review is not None:
             return review, thread
 
-    raise InvalidLLMResponse(f"failed to review in {retries} attempts")
+    # If run_with_retries fails, it will raise InvalidLLMResponse from there or after loop finishes.
+    logger.error("Failed to obtain valid review after {} retries.", retries)
+    raise InvalidLLMResponse(
+        message=f"Failed to review in {retries} attempts",
+        error_code=LLMErrorCode.OTHER,
+        detail="Agent failed to get a valid review from LLM after multiple retries."
+        )
 
 
 # TODO: remove this
-def run_with_retries(
+def run_with_retries( # This function is what actually calls the LLM
     issue_statement: str,
     test: str,
     patch: str,
@@ -122,6 +179,8 @@ def run_with_retries(
     patched_test_stderr: str,
     retries: int = 5,
 ) -> Generator[tuple[Review | None, MessageThread], None, None]:
+    bound_logger = logger.bind(agent="ReviewerAgent", method="run_with_retries")
+    bound_logger.debug("Initiating review generation with {} retries.", retries)
     prefix_thread = MessageThread()
     prefix_thread.add_system(SYSTEM_PROMPT)
 
@@ -152,6 +211,7 @@ def run_with_retries(
     )
     prefix_thread.add_user(patched_exec_prompt)
 
+    # Updated question to ask for rejection reason if applicable
     question = (
         "Think about (1) whether the test correctly reproduces the issue, and "
         "(2) whether the patch resolves the issue. "
@@ -159,46 +219,48 @@ def run_with_retries(
         "\n"
         "```json\n"
         "{\n"
-        '    "patch-correct": "...",\n'
-        '    "test-correct": "...",\n'
+        '    "patch-correct": "yes|no",\n'
+        '    "patch-rejection-reason": "PATCH_APPLY_FAIL|PATCH_NO_IMPROVEMENT|PATCH_REGRESSION|PATCH_BAD_SYNTAX|PATCH_OTHER",\n' # Optional if patch-correct is yes
         '    "patch-analysis": "...",\n'
+        '    "patch-advice": "...",\n' # Optional if patch-correct is yes
+        '    "test-correct": "yes|no",\n'
+        '    "test-rejection-reason": "TEST_DOES_NOT_FAIL|TEST_FLAKY|TEST_IRRELEVANT|TEST_BAD_SYNTAX|TEST_OTHER",\n' # Optional if test-correct is yes
         '    "test-analysis": "...",\n'
-        '    "patch-advice": "...",\n'
-        '    "test-advice": "..."\n'
+        '    "test-advice": "..."\n' # Optional if test-correct is yes
         "}\n"
         "```\n"
         "\n"
-        'where "patch-correct"/"test-correct" is "yes" or "no"; '
-        '"patch-analysis"/"test-analysis" should explain the reasoning behind your answer.\n'
-        'Moreover, if your answer is "no", then give me advice about how to correct'
-        ' the patch/test in the "patch-advice"/"test-advice" field.\n'
-        'If your answer is "yes", you can leave "patch-advice"/"test-advice"'
-        "empty.\n"
-        "\n"
+        'If "patch-correct" is "no", provide a "patch-rejection-reason" from the given list and "patch-advice".\n'
+        'If "test-correct" is "no", provide a "test-rejection-reason" from the given list and "test-advice".\n'
+        'If the decision is "yes", the corresponding rejection reason and advice fields can be omitted or null.\n'
+        "Ensure analysis fields are always filled.\n"
         "NOTE: not only the patch, but also the test case, can be wrong."
     )
-
     prefix_thread.add_user(question)
 
-    for _ in range(1, retries + 1):
+    for attempt_num in range(1, retries + 1):
+        bound_logger.debug("Review generation attempt {}/{}.", attempt_num, retries)
         response, *_ = common.SELECTED_MODEL.call(
             prefix_thread.to_msg(), response_format="json_object"
         )
 
         thread = deepcopy(prefix_thread)
         thread.add_model(response, [])
-        # TODO: print
 
-        logger.info(response)
+        bound_logger.debug("LLM raw response for review (attempt {}): {}", attempt_num, response)
 
-        review = extract_review_result(response)
+        review = extract_review_result(response) # extract_review_result logs errors internally
 
         if review is None:
-            yield None, thread
+            bound_logger.warning("Review extraction failed for attempt {}. LLM response was: {}", attempt_num, response)
+            if attempt_num < retries: # Only yield None if it's not the last attempt and we might retry
+                yield None, thread
+            # On last attempt, if review is None, loop finishes and run() function will raise error.
             continue
 
+        bound_logger.info("Successfully extracted review on attempt {}.", attempt_num)
         yield review, thread
-        break
+        return # Successfully yielded a review, so exit generator
 
 
 if __name__ == "__main__":

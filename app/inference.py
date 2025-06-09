@@ -31,31 +31,46 @@ def write_patch_iterative_with_review(
     review_manager: ReviewManager,
     retries=3,
 ) -> bool:
-    logger.info("Start generating patches with reviewer")
+    task_id = task.get_instance_id()
+    bound_logger = logger.bind(task_id=task_id, component="write_patch_iterative_with_review")
+    bound_logger.info("Start generating patches with reviewer")
     patch_gen = review_manager.generator()
 
-    eval_summary = None
+    eval_payload = None # Will now be EvaluationPayload | None
     for _ in range(retries):
         try:
-            patch_handle, patch_content = patch_gen.send(eval_summary)
-            logger.info("Reviewer approved patch: {}", patch_handle)
+            # Send the previous iteration's eval_payload (or None for the first iteration)
+            patch_handle, patch_content = patch_gen.send(eval_payload)
+            bound_logger.info("Reviewer approved patch: {}", patch_handle)
         except StopIteration:
+            bound_logger.info("Patch generator finished.")
             break
+        except InvalidLLMResponse as e:
+            bound_logger.error(f"Invalid LLM response from patch generator: {e}", exc_info=True)
+            break # Stop if LLM fails badly
 
-        logger.info("Begin evaluating patch: {}", patch_handle)
-        eval_passed, eval_summary = validation.evaluate_patch(
+        bound_logger.info("Begin evaluating patch: {}", patch_handle)
+        # validation.evaluate_patch now returns tuple[bool, EvaluationPayload]
+        overall_eval_passed, eval_payload_obj = validation.evaluate_patch(
             task, patch_handle, patch_content, output_dir
         )
+        eval_payload = eval_payload_obj # Store for the next send()
 
-        if eval_passed:
+        # Log the detailed status
+        bound_logger.info(f"Patch evaluation status: {eval_payload.status.value}, Message: {eval_payload.message}")
+        if eval_payload.details:
+             bound_logger.debug(f"Evaluation details: {json.dumps(eval_payload.details, indent=2)}")
+
+
+        if overall_eval_passed:
             patch_gen.close()
 
-            logger.info(
-                "Patch {} passed evaluation. Ending patch generation", patch_handle
+            bound_logger.info(
+                "Patch {} passed evaluation. Ending patch generation.", patch_handle
             )
             return True
 
-        logger.info("Patch {} failed evaluation", patch_handle)
+        bound_logger.warning("Patch {} failed evaluation.", patch_handle) # Changed to warning
 
     return False
 
@@ -66,31 +81,41 @@ def write_patch_iterative(
     review_manager: ReviewManager,
     retries=3,
 ) -> bool:
-    logger.info("Start generating patches without reviewer")
+    task_id = task.get_instance_id()
+    bound_logger = logger.bind(task_id=task_id, component="write_patch_iterative")
+    bound_logger.info("Start generating patches without reviewer")
 
     patch_gen = review_manager.patch_only_generator()
 
     for _ in range(retries):
         try:
-            patch_handle, patch_content = patch_gen.send(None)
-            logger.info("Generated applicable patch: {}", patch_handle)
+            patch_handle, patch_content = patch_gen.send(None) # No feedback sent in this mode initially
+            bound_logger.info("Generated applicable patch: {}", patch_handle)
         except StopIteration:
+            bound_logger.info("Patch (no review) generator finished.")
+            break
+        except InvalidLLMResponse as e:
+            bound_logger.error(f"Invalid LLM response from patch (no review) generator: {e}", exc_info=True)
             break
 
-        logger.info("Begin evaluating patch: {}", patch_handle)
-        eval_passed, _ = validation.evaluate_patch(
+        bound_logger.info("Begin evaluating patch: {}", patch_handle)
+        # Capture the full payload to log details
+        eval_passed, eval_payload = validation.evaluate_patch(
             task, patch_handle, patch_content, output_dir
         )
+        bound_logger.info(f"Patch evaluation status: {eval_payload.status.value}, Message: {eval_payload.message}")
+        if eval_payload.details:
+            bound_logger.debug(f"Evaluation (no review) details: {json.dumps(eval_payload.details, indent=2)}")
+
 
         if eval_passed:
             patch_gen.close()
-
-            logger.info(
-                "Patch {} passed evaluation. Ending patch generation", patch_handle
+            bound_logger.info(
+                "Patch {} passed evaluation. Ending patch generation.", patch_handle
             )
             return True
 
-        logger.info("Patch {} failed evaluation", patch_handle)
+        bound_logger.warning("Patch {} failed evaluation.", patch_handle) # Changed to warning
 
     return False
 
@@ -110,8 +135,9 @@ def run_one_task(task: Task, output_dir: str, model_names: Iterable[str]) -> boo
     for idx in range(config.overall_retry_limit):
         model_name = next(model_name_cycle)
         set_model(model_name)
+        task_id_for_retry = task.get_instance_id() # Get task_id for binding
 
-        logger.info("Starting overall retry {} with model {}", idx, model_name)
+        logger.bind(task_id=task_id_for_retry, component="run_one_task").info("Starting overall retry {} with model {}", idx, model_name)
 
         out_dir = Path(output_dir, f"output_{idx}")
 
@@ -125,18 +151,18 @@ def run_one_task(task: Task, output_dir: str, model_names: Iterable[str]) -> boo
 
         api_manager = ProjectApiManager(task, str(out_dir))
 
-        if _run_one_task(str(out_dir), api_manager, task.get_issue_statement()):
-            logger.info("Overall retry {} succeeded; ending workflow", idx)
+        if _run_one_task(str(out_dir), api_manager, task.get_issue_statement()): # This will have its own task_id binding
+            logger.bind(task_id=task_id_for_retry, component="run_one_task").info("Overall retry {} succeeded; ending workflow.", idx)
             break
 
-        logger.info("Overall retry {} failed; proceeding to next retry", idx)
+        logger.bind(task_id=task_id_for_retry, component="run_one_task").warning("Overall retry {} failed; proceeding to next retry.", idx)
 
-    logger.info("Starting patch selection")
+    logger.bind(task_id=task.get_instance_id(), component="run_one_task").info("Starting patch selection") # Bind task_id here too
 
-    selected, details = select_patch(task, output_dir)
+    selected, details = select_patch(task, output_dir) # select_patch will bind its own task_id
     Path(output_dir, "selected_patch.json").write_text(json.dumps(details, indent=4))
 
-    logger.info("Selected patch {}. Reason: {}", selected, details["reason"])
+    logger.bind(task_id=task.get_instance_id(), component="run_one_task").info("Selected patch {}. Reason: {}", selected, details["reason"])
 
     return True
 
@@ -147,10 +173,17 @@ def select_patch(task: Task, output_dir: str | PathLike) -> tuple[str, dict]:
 
     # TODO: These candidate patches must have been dismissed by reviewer. Maybe an
     # assertion should be added to confirm this.
-    candidate_patches = [p for p in patches if may_pass_regression_tests(task, p)]
+
+    # Bind task_id for select_patch logs
+    task_id = task.get_instance_id()
+    bound_logger = logger.bind(task_id=task_id, component="select_patch")
+
+    candidate_patches = [p for p in patches if may_pass_regression_tests(task, p)] # may_pass_regression_tests also needs context if it logs
 
     agent_comment = None
     thread = None
+
+    bound_logger.debug("Candidate patches for selection: {}", candidate_patches)
 
     for p in candidate_patches:
         index = p.with_suffix("").name.rpartition("_")[2]
@@ -191,10 +224,28 @@ def select_patch(task: Task, output_dir: str | PathLike) -> tuple[str, dict]:
                         [p.read_text() for p in candidate_patches],
                     )
                     reason = "agent-selected,multiple-pass-regression"
-                except Exception:
-                    index = -1
+                except Exception as e:
+                    bound_logger.error(f"Agent select for multiple candidates failed: {e}", exc_info=True)
+                    index = -1 # Ensure index is set for selected_patch access
                     reason = "agent-error,multiple-pass-regression"
-                selected_patch = candidate_patches[index]
+                # Check if candidate_patches is not empty and index is valid
+                if candidate_patches and index >= 0 and index < len(candidate_patches):
+                    selected_patch = candidate_patches[index]
+                elif candidate_patches: # Fallback if agent failed or returned invalid index
+                    bound_logger.warning("Agent selection failed or returned invalid index, falling back to first candidate.")
+                    selected_patch = candidate_patches[0]
+                    reason = "agent-fallback,multiple-pass-regression"
+                else: # No candidates, this branch shouldn't be hit if len(candidate_patches) > 1
+                      # but as a safeguard:
+                    bound_logger.error("No candidate patches found in agent selection fallback logic.")
+                    # This state is problematic, how to select a patch?
+                    # For now, this will likely error out if no patches exist and this path is taken.
+                    # Or, ensure selected_patch is defined if this else path is taken.
+                    # This part of the logic might need revisiting if candidate_patches can be empty here.
+                    # If no patches, this whole 'else' for len(candidate_patches) > 1 won't run.
+                    # The code will proceed to the len(candidate_patches) == 1 or == 0 cases.
+                    pass # Let it fall through, outer logic handles no patches
+
         elif len(candidate_patches) == 1:
             selected_patch = candidate_patches[0]
             reason = "no-agent,single-pass-regression"
@@ -219,10 +270,49 @@ def select_patch(task: Task, output_dir: str | PathLike) -> tuple[str, dict]:
                         task.get_issue_statement(), [p.read_text() for p in patches]
                     )
                     reason = "agent-selected,none-pass-regression"
-                except Exception:
+                except Exception as e:
+                    bound_logger.error(f"Agent select for no regression pass candidates failed: {e}", exc_info=True)
                     index = -1
                     reason = "agent-error,none-pass-regression"
-                selected_patch = patches[index]
+
+                if patches and index >= 0 and index < len(patches):
+                    selected_patch = patches[index]
+                elif patches: # Fallback if agent failed or returned invalid index
+                    bound_logger.warning("Agent selection failed or returned invalid index, falling back to first patch.")
+                    selected_patch = patches[0]
+                    reason = "agent-fallback,none-pass-regression"
+                else: # No patches at all
+                    bound_logger.error("No patches available for selection by agent.")
+                    # This indicates a problem, as select_patch should ideally always select something if patches exist.
+                    # Or handle the case where 'patches' list itself is empty.
+                    # If 'patches' is empty, this 'else' block for len(candidate_patches) == 0 is hit.
+                    # The function must return a valid path string, or raise error.
+                    # For now, assuming 'patches' is non-empty if this logic path is taken.
+                    # If patches is empty, this code will fail. Need to check len(patches) == 0 first.
+
+    # Handle case where no patches are available at all
+    if not patches:
+        bound_logger.error("No patches found in the output directory for selection.")
+        # Return a placeholder or raise an exception, as no patch can be selected.
+        # Depending on expected behavior, this might be an error state.
+        # For now, returning a dummy path and reason.
+        return "no_patch_found.diff", {"selected_patch": "no_patch_found.diff", "reason": "no-patches-available"}
+
+
+    # Ensure selected_patch is defined before attempting to use it.
+    # This can happen if candidate_patches was empty and patches was also empty through some logic error.
+    if 'selected_patch' not in locals() and patches: # If not defined, but patches exist, default to first overall patch
+        bound_logger.warning("Selected_patch was not defined despite patches existing. Defaulting to first patch.")
+        selected_patch = patches[0]
+        reason = "fallback-undefined-selection"
+    elif 'selected_patch' not in locals() and not patches: # Should have been caught by 'if not patches:'
+         # This case should ideally not be reached if the above 'if not patches:' handles it.
+         # Re-asserting for clarity or if logic changes.
+         bound_logger.error("Critical: No patches available and selected_patch is undefined.")
+         return "critical_no_patch.diff", {"selected_patch": "critical_no_patch.diff", "reason": "critical-no-patches"}
+
+
+    rel_selected_patch = str(selected_patch.relative_to(output_dir))
 
     rel_selected_patch = str(selected_patch.relative_to(output_dir))
 
@@ -263,10 +353,14 @@ def may_pass_regression_tests(task: Task, patch_file: str | PathLike) -> bool:
 def _run_one_task(
     output_dir: str, api_manager: ProjectApiManager, problem_stmt: str
 ) -> bool:
+    task_id = api_manager.task.get_instance_id()
+    bound_logger = logger.bind(task_id=task_id, component="_run_one_task")
+
+    # These print_banner and print_issue calls already log to JSON via app.log modifications
     print_banner("Starting AutoCodeRover on the following issue")
     print_issue(problem_stmt)
 
-    test_agent = TestAgent(api_manager.task, output_dir)
+    test_agent = TestAgent(api_manager.task, output_dir) # TestAgent might need task_id for its own logging
 
     repro_result_map = {}
     repro_stderr = ""
@@ -286,13 +380,13 @@ def _run_one_task(
             reproduced = True
             reproduced_test_content = test_content
         # TODO: utilize the test for localization
-    except NoReproductionStep:
-        logger.info(
+    except NoReproductionStep as e:
+        bound_logger.info(
             "Test agent decides that the issue statement does not contain "
-            "reproduction steps; skipping reproducer tracing"
+            f"reproduction steps; skipping reproducer tracing. Details: {e}"
         )
-    except InvalidLLMResponse:
-        logger.warning("Failed to write a reproducer test; skipping reproducer tracing")
+    except InvalidLLMResponse as e:
+        bound_logger.warning(f"Failed to write a reproducer test; skipping reproducer tracing: {e}", exc_info=True)
 
     if config.enable_sbfl:
         sbfl_result, *_ = api_manager.fault_localization()
@@ -300,21 +394,24 @@ def _run_one_task(
         sbfl_result = ""
 
     bug_locs: list[BugLocation]
-    bug_locs, search_msg_thread = api_manager.search_manager.search_iterative(
+    bug_locs, search_msg_thread = api_manager.search_manager.search_iterative( # This itself might log
         api_manager.task, sbfl_result, repro_stderr, reproduced_test_content
     )
 
-    logger.info("Search completed. Bug locations: {}", bug_locs)
+    bound_logger.info("Search completed. Bug locations found: {}", len(bug_locs))
+    bound_logger.debug("Bug locations details: {}", bug_locs)
 
-    # logger.info("Additional class context code: {}", class_context_code)
+
+    # logger.info("Additional class context code: {}", class_context_code) # This was commented out
     # done with search; dump the tool calls used for recording
-    api_manager.search_manager.dump_tool_call_layers_to_file()
+    api_manager.search_manager.dump_tool_call_layers_to_file() # This might log
 
     # Write patch
+    # print_banner already logs to JSON
     print_banner("PATCH GENERATION")
-    logger.debug("Gathered enough information. Invoking write_patch.")
+    bound_logger.debug("Gathered enough information. Invoking write_patch.")
 
-    review_manager = ReviewManager(
+    review_manager = ReviewManager( # ReviewManager might need task_id for its logging
         search_msg_thread,
         bug_locs,
         api_manager.search_manager,
@@ -326,17 +423,22 @@ def _run_one_task(
 
     if config.reproduce_and_review and reproduced:
         try:
-            return write_patch_iterative_with_review(
+            return write_patch_iterative_with_review( # This function now binds its own task_id
                 api_manager.task, output_dir, review_manager
             )
         # this exception can arise when writing new reproducers
-        except NoReproductionStep:
-            pass
+        except NoReproductionStep as e:
+            bound_logger.warning(f"NoReproductionStep caught during review process: {e}. Falling back to non-review iteration.", exc_info=True)
+            # Fall through to non-review version
 
-    result = write_patch_iterative(api_manager.task, output_dir, review_manager)
-    logger.info(
-        "Invoked write_patch. Since there is no reproducer, the workflow will be terminated."
-    )
+    result = write_patch_iterative(api_manager.task, output_dir, review_manager) # This function also binds its own task_id
+    # The message below might be misleading if result from write_patch_iterative is True (meaning patch was found and passed)
+    if not reproduced:
+        bound_logger.info(
+            "write_patch_iterative finished. Original issue had no reproducer or reproducer failed. Workflow outcome depends on patch evaluation."
+        )
+    else:
+        bound_logger.info("write_patch_iterative finished. Workflow outcome depends on patch evaluation.")
     return result
 
 

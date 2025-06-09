@@ -88,3 +88,128 @@ def test_str_method():
     # The string representation should include the function name and the arguments.
     assert func_name in s
     assert str(arguments) in s
+
+# Tests for EvaluationPayload
+from app.data_structures import EvaluationPayload
+from app.api.eval_helper import ResolvedStatus # Assuming ResolvedStatus is in eval_helper
+
+def test_evaluation_payload_instantiation():
+    """Test basic instantiation of EvaluationPayload."""
+    payload = EvaluationPayload(
+        status=ResolvedStatus.FULL,
+        message="All tests passed.",
+        details={"F2P_count": 5, "P2P_count": 10}
+    )
+    assert payload.status == ResolvedStatus.FULL
+    assert payload.message == "All tests passed."
+    assert payload.details == {"F2P_count": 5, "P2P_count": 10}
+
+def test_evaluation_payload_to_llm_feedback_string_no_details():
+    """Test to_llm_feedback_string with no details."""
+    payload = EvaluationPayload(
+        status=ResolvedStatus.NO,
+        message="Patch failed."
+    )
+    expected_string = "Patch evaluation result: RESOLVED_NO. Patch failed."
+    assert payload.to_llm_feedback_string() == expected_string
+
+def test_evaluation_payload_to_llm_feedback_string_empty_details():
+    """Test to_llm_feedback_string with empty details."""
+    payload = EvaluationPayload(
+        status=ResolvedStatus.PARTIAL,
+        message="Partially resolved.",
+        details={}
+    )
+    expected_string = "Patch evaluation result: RESOLVED_PARTIAL. Partially resolved."
+    assert payload.to_llm_feedback_string() == expected_string
+
+def test_evaluation_payload_to_llm_feedback_string_with_f2p_p2p_details():
+    """Test to_llm_feedback_string with F2P and P2P details."""
+    details_data = {
+        "FAIL_TO_PASS": {
+            "success": ["test_a", "test_b"],
+            "failure": ["test_c"],
+            "missing": []
+        },
+        "PASS_TO_PASS": {
+            "success": ["test_d"],
+            "failure": [],
+            "missing": ["test_e"]
+        }
+    }
+    payload = EvaluationPayload(
+        status=ResolvedStatus.PARTIAL,
+        message="Mixed results.",
+        details=details_data
+    )
+    # Expected string construction can be a bit complex due to potential ordering or specific formatting
+    # For now, check for key components
+    result_string = payload.to_llm_feedback_string()
+    assert "Patch evaluation result: RESOLVED_PARTIAL. Mixed results." in result_string
+    assert "Test outcome details:" in result_string
+    assert "Fail-to-Pass: 2 succeeded, 1 failed, 0 missing." in result_string
+    assert "Pass-to-Pass: 1 succeeded, 0 failed, 1 missing." in result_string
+
+def test_evaluation_payload_to_llm_feedback_string_with_only_one_category_details():
+    """Test to_llm_feedback_string with only F2P details."""
+    details_data = {
+        "FAIL_TO_PASS": {
+            "success": ["test_a"],
+            "failure": [],
+            "missing": []
+        }
+    }
+    payload = EvaluationPayload(
+        status=ResolvedStatus.FULL_P2P_NA, # Example status
+        message="F2P resolved, no P2P tests.",
+        details=details_data
+    )
+    result_string = payload.to_llm_feedback_string()
+    assert "Patch evaluation result: RESOLVED_FULL_P2P_NA. F2P resolved, no P2P tests." in result_string
+    assert "Test outcome details:" in result_string
+    assert "Fail-to-Pass: 1 succeeded, 0 failed, 0 missing." in result_string
+    assert "Pass-to-Pass" not in result_string # P2P data is not present
+
+def test_evaluation_payload_to_llm_feedback_string_with_other_details():
+    """Test to_llm_feedback_string with other arbitrary details."""
+    details_data = {
+        "custom_metric": 0.75,
+        "notes": "Some notes here"
+    }
+    payload = EvaluationPayload(
+        status=ResolvedStatus.NO,
+        message="Evaluation with custom metrics.",
+        details=details_data
+    )
+    result_string = payload.to_llm_feedback_string()
+    assert "Patch evaluation result: RESOLVED_NO. Evaluation with custom metrics." in result_string
+    # The current implementation of to_llm_feedback_string only specifically formats F2P/P2P.
+    # Other details are json.dumps'd.
+    assert f"\nDetails: {json.dumps(details_data)}" in result_string
+
+def test_evaluation_payload_to_llm_feedback_string_f2p_p2p_zero_counts():
+    """Test to_llm_feedback_string when F2P/P2P success/failure/missing are all zero."""
+    details_data = {
+        "FAIL_TO_PASS": {
+            "success": [],
+            "failure": [],
+            "missing": []
+        },
+        "PASS_TO_PASS": {
+            "success": [],
+            "failure": [],
+            "missing": []
+        }
+    }
+    payload = EvaluationPayload(
+        status=ResolvedStatus.FULL,
+        message="All good, but no specific F2P/P2P data to show.",
+        details=details_data
+    )
+    result_string = payload.to_llm_feedback_string()
+    # According to current to_llm_feedback_string logic, if all counts are zero, the category line is not added.
+    assert "Fail-to-Pass" not in result_string
+    assert "Pass-to-Pass" not in result_string
+    # If there are other details, they would be json.dumps'd. If only these empty F2P/P2P, details section might be minimal.
+    # Current implementation: if detail_items is empty, it falls back to json.dumps(self.details)
+    assert f"\nDetails: {json.dumps(details_data)}" in result_string

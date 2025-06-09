@@ -13,7 +13,7 @@ from typing import TypeAlias
 from loguru import logger
 
 from app.agents import agent_common
-from app.agents.agent_common import InvalidLLMResponse
+from app.agents.agent_common import InvalidLLMResponse, LLMErrorCode
 from app.data_structures import BugLocation, MessageThread
 from app.log import print_acr, print_patch_generation
 from app.model import common
@@ -106,8 +106,11 @@ class PatchAgent:
         self._request_idx: int = -1
         self._responses: dict[PatchHandle, str] = {}
         self._diffs: dict[PatchHandle, str] = {}
-        self._feedbacks: dict[PatchHandle, list[str]] = defaultdict(list)
+        # _feedbacks can now store strings or structured EvaluationPayload objects
+        self._feedbacks: dict[PatchHandle, list[Any]] = defaultdict(list) # Using Any for list type
         self._history: list[PatchHandle] = []
+        self.task_id = task.get_instance_id()
+        self.bound_logger = logger.bind(task_id=self.task_id, agent="PatchAgent")
 
     def write_applicable_patch_without_feedback(
         self, retries: int = 3
@@ -121,43 +124,60 @@ class PatchAgent:
             max_feedbacks=max_feedbacks, retries=retries
         )
 
-    def add_feedback(self, handle: PatchHandle, feedback: str) -> None:
+    # Changed feedback type to Any to accommodate str or EvaluationPayload
+    def add_feedback(self, handle: PatchHandle, feedback: Any) -> None:
         if handle not in self._diffs:
-            raise ValueError("patch {} does not exist", handle)
+            if handle != PatchAgent.EMPTY_PATCH_HANDLE:
+                self.bound_logger.error("Attempted to add feedback to non-existent patch handle: {}", handle)
+                raise ValueError(f"Patch handle {handle} does not exist in diffs to add feedback.")
 
         self._feedbacks[handle].append(feedback)
+        self.bound_logger.debug("Added feedback for patch handle {}. Feedback type: {}", handle, type(feedback).__name__)
 
     def _write_applicable_patch(
         self, max_feedbacks: int, retries: int
     ) -> tuple[PatchHandle, str]:
         max_feedbacks = max_feedbacks if max_feedbacks >= 0 else len(self._history)
-        num_feedbacks = min(max_feedbacks, len(self._history))
-        history_handles = self._history[-num_feedbacks:]
+        # Ensure num_feedbacks is not negative if self._history is empty.
+        num_feedbacks = min(max_feedbacks, len(self._history)) if self._history else 0
+        history_handles = self._history[-num_feedbacks:] if num_feedbacks > 0 else []
 
-        for _ in range(retries):
+        for i in range(retries):
+            self.bound_logger.info("Attempt {}/{} to write applicable patch. Max feedbacks: {}. History handles: {}",
+                                i + 1, retries, num_feedbacks, history_handles) # Use num_feedbacks not max_feedbacks
+
             applicable, response, diff_content, thread = self._write_patch(
                 history_handles
             )
             self._request_idx += 1
-            print_patch_generation(response)
-            Path(self.task_dir, f"patch_raw_{self._request_idx}.md").write_text(
-                response
-            )
-            thread.save_to_file(
-                Path(self.task_dir, f"conv_patch_{self._request_idx}.json")
-            )
+
+            # print_patch_generation already logs to JSON
+            print_patch_generation(response, desc=f"attempt_{self._request_idx}")
+
+            raw_response_path = Path(self.task_dir, f"patch_raw_{self._request_idx}.md")
+            raw_response_path.write_text(response)
+            self.bound_logger.debug("Saved raw patch LLM response to {}", raw_response_path)
+
+            conv_path = Path(self.task_dir, f"conv_patch_{self._request_idx}.json")
+            thread.save_to_file(conv_path)
+            self.bound_logger.debug("Saved patch generation conversation to {}", conv_path)
 
             msg = "Patch is applicable" if applicable else "Patch is not applicable"
-            print_acr(msg)
-            if applicable:
-                print_acr(f"```diff\n{diff_content}\n```", "Extracted patch")
+            # print_acr already logs to JSON
+            print_acr(msg, desc=f"applicability_check_{self._request_idx}")
 
+            if applicable:
+                # print_acr already logs to JSON
+                print_acr(f"```diff\n{diff_content}\n```", desc=f"extracted_patch_{self._request_idx}")
                 handle = self._register_applicable_patch(response, diff_content)
+                self.bound_logger.info("Registered applicable patch. Handle: {}, Request Index: {}", handle, self._request_idx)
 
                 return handle, diff_content
 
         raise InvalidLLMResponse(
-            f"Failed to write an applicable patch in {retries} attempts"
+            message=f"Failed to write an applicable patch in {retries} attempts",
+            error_code=LLMErrorCode.OTHER,
+            detail="The agent could not produce a valid, applicable patch after multiple attempts and feedback cycles."
         )
 
     def _write_patch(
@@ -169,32 +189,52 @@ class PatchAgent:
         thread = self._construct_init_thread()
 
         is_first_try = not any(handle in self._feedbacks for handle in history_handles)
-
-        logger.debug(f"<agent write patch> is_first_try: {is_first_try}")
+        self.bound_logger.debug(f"Patch writing attempt. Is first try for this agent instance: {is_first_try}. History handles provided: {history_handles}")
 
         for handle in history_handles:
-            feedbacks = self._feedbacks.get(handle, [])
-            if not feedbacks:
-                logger.warning("patch {} does not have a feedback; skipping", handle)
-                continue
+            feedbacks_for_llm = self._feedbacks.get(handle, [])
+            if not feedbacks_for_llm:
+                if handle in self._responses:
+                    thread.add_model(self._responses[handle], [])
+            else:
+                if handle in self._responses:
+                     thread.add_model(self._responses[handle], [])
+                else:
+                    if handle != PatchAgent.EMPTY_PATCH_HANDLE:
+                        self.bound_logger.warning(f"Feedback exists for handle {handle} but no prior response stored.")
 
-            thread.add_model(self._responses[handle], [])
-
-            for feedback in feedbacks:
-                thread.add_user(feedback)
+                for feedback_item in feedbacks_for_llm:
+                    if isinstance(feedback_item, str):
+                        thread.add_user(feedback_item)
+                    else:
+                        try:
+                            to_llm_string_method = getattr(feedback_item, "to_llm_feedback_string", None)
+                            if callable(to_llm_string_method):
+                                feedback_str = to_llm_string_method()
+                            else:
+                                self.bound_logger.warning(f"Feedback item for handle {handle} is not str and has no 'to_llm_feedback_string' method. Using str().")
+                                feedback_str = str(feedback_item)
+                            thread.add_user(feedback_str)
+                        except Exception as e:
+                            self.bound_logger.error(f"Error converting feedback item to string for handle {handle}: {e}. Using str().", exc_info=True)
+                            thread.add_user(str(feedback_item))
 
         thread.add_user(USER_PROMPT_INIT)
 
-        if not history_handles:
-            print_acr(USER_PROMPT_INIT)
+        if not history_handles: # First attempt overall for this agent
+             # print_acr already logs to JSON
+            print_acr(USER_PROMPT_INIT, desc=f"initial_prompt_request_{self._request_idx}")
 
+        self.bound_logger.debug("Calling LLM for patch generation. Current thread length: {}", len(thread.messages))
         patch_resp, *_ = common.SELECTED_MODEL.call(thread.to_msg())
-        thread.add_model(patch_resp)
+        thread.add_model(patch_resp) # Add model response to thread for saving
 
+        self.bound_logger.debug("Attempting to convert LLM response to diff.")
         extract_status, _, diff_content = convert_response_to_diff(
-            patch_resp, self.task_dir
+            patch_resp, self.task_dir # This function might need internal logging improvements
         )
-        record_extract_status(self.task_dir, extract_status)
+        record_extract_status(self.task_dir, extract_status) # This could log
+        self.bound_logger.info("Patch extraction status: {}. Diff length: {}", extract_status, len(diff_content or ""))
 
         return (
             extract_status == ExtractStatus.APPLICABLE_PATCH,
@@ -208,13 +248,13 @@ class PatchAgent:
         Construct the initial patch gen conv thread, based on whether bug location is available.
         """
         if self.bug_locs:
-            # bug location is available
+            self.bound_logger.debug("Constructing patch thread with bug_locs.")
             thread = MessageThread()
             thread.add_system(SYSTEM_PROMPT)
             thread.add_user(f"Here is the issue:\n{self.issue_stmt}")
             thread.add_user(self._construct_code_context_prompt())
         else:
-            # bug location not there; we use the search conv history to at least get some context
+            self.bound_logger.debug("Constructing patch thread from search conversation history as no bug_locs provided.")
             messages = deepcopy(self.context_thread.messages)
             thread = MessageThread(messages)
             thread = agent_common.replace_system_prompt(thread, SYSTEM_PROMPT)

@@ -19,37 +19,47 @@ from app.task import SweTask, Task
 from app.agents.agent_write_patch import PatchHandle
 
 
+from app.data_structures import EvaluationPayload # For type checking
+from app.api.eval_helper import ResolvedStatus, TestStatus, FAIL_TO_PASS, PASS_TO_PASS, FAIL_TO_FAIL, PASS_TO_FAIL # For mocking and asserting
+
 # --- Dummy and Fixture Setup ---
 
-
-class DummyTask(Task):
-    def __init__(self, task_id, project_path):
-        self.task_id = task_id
+class DummyTask(Task): # Basic Task for non-SWE-bench scenarios
+    def __init__(self, task_id="dummy_task", project_path="dummy_project_path", repo_name="dummy/repo"):
+        self._task_id = task_id
         self.project_path = project_path
+        self.repo_name = repo_name # For get_logs_eval
 
-    def validate(self, patch_content):
-        # Simulate a validation that passes.
-        # Create two temporary log files.
-        log_file = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
-        orig_log_file = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
-        log_file.close()
-        orig_log_file.close()
-        return True, "Validation passed", log_file.name, orig_log_file.name
+    def get_instance_id(self) -> str:
+        return self._task_id
 
+    def validate(self, patch_content: str) -> tuple[bool, str, str, str]:
+        # Ensure log files are actually created for Path().exists() checks
+        # These will be moved by validate_and_move_logs in evaluate_patch
+        # So, the test needs to expect them in the output_dir
+        dummy_eval_log = Path(tempfile.gettempdir()) / f"dummy_eval_{Path(tempfile.NamedTemporaryFile(delete=False).name).name}.log"
+        dummy_orig_log = Path(tempfile.gettempdir()) / f"dummy_orig_{Path(tempfile.NamedTemporaryFile(delete=False).name).name}.log"
+        dummy_eval_log.write_text("EVAL LOG CONTENT")
+        dummy_orig_log.write_text("ORIG LOG CONTENT")
+        # Return True (regression check passed), message, and paths to *temporary* files
+        return True, "Validation regression check passed", str(dummy_eval_log), str(dummy_orig_log)
 
-# DummySweTask now accepts task_id and project_path.
-class DummySweTask(SweTask):
-    def __init__(self, task_id, project_path):
-        self.task_id = task_id
+class DummySweTask(SweTask): # For SWE-bench specific scenarios (if any in tests)
+    def __init__(self, task_id="dummy_swe_task", project_path="dummy_swe_project_path", repo="swe/repo"):
+        self.instance = {"repo": repo, "instance_id": task_id}
+        self.task_id = task_id # Keep for consistency if used directly
         self.project_path = str(project_path)
+        self.repo_name = repo # For get_logs_eval
 
-    def validate(self, patch_content):
-        # Same dummy validate as above.
-        log_file = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
-        orig_log_file = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
-        log_file.close()
-        orig_log_file.close()
-        return True, "Validation passed", log_file.name, orig_log_file.name
+    def get_instance_id(self) -> str:
+        return self.instance["instance_id"]
+
+    def validate(self, patch_content: str) -> tuple[bool, str, str, str]:
+        dummy_eval_log = Path(tempfile.gettempdir()) / f"dummy_swe_eval_{Path(tempfile.NamedTemporaryFile(delete=False).name).name}.log"
+        dummy_orig_log = Path(tempfile.gettempdir()) / f"dummy_swe_orig_{Path(tempfile.NamedTemporaryFile(delete=False).name).name}.log"
+        dummy_eval_log.write_text("SWE EVAL LOG")
+        dummy_orig_log.write_text("SWE ORIG LOG")
+        return True, "SWE Validation regression check passed", str(dummy_eval_log), str(dummy_orig_log)
 
 
 class DummyPatchHandle(PatchHandle):
@@ -260,36 +270,130 @@ def test_perfect_angelic_debug(monkeypatch, tmp_path):
 
 
 def test_evaluate_patch(monkeypatch, tmp_path):
+    # Store original config values
+    original_enable_validation = config.enable_validation
+    original_enable_perfect_angelic = config.enable_perfect_angelic
+    original_enable_angelic = config.enable_angelic
+
     config.enable_validation = True
-    config.enable_perfect_angelic = True
+    config.enable_perfect_angelic = False # Disable angelic by default for this basic test
     config.enable_angelic = False
 
-    # Use DummySweTask with our fixed __init__.
-    project_dir = tmp_path / "project"
-    project_dir.mkdir()
-    dummy_py = project_dir / "dummy.py"
-    dummy_py.write_text("def foo():\n    pass\n")
-    task = DummySweTask(task_id="dummy_task", project_path=project_dir)
+    task = DummyTask(repo_name="dummy/repo") # Use repo_name consistent with get_logs_eval needs
     patch_handle = DummyPatchHandle()
     patch_content = "dummy patch content"
 
-    dummy_log = tmp_path / "dummy.log"
-    dummy_log.write_text("log")
-    dummy_orig_log = tmp_path / "dummy_orig.log"
-    dummy_orig_log.write_text("orig log")
+    output_dir_path = tmp_path / "output"
+    output_dir_path.mkdir()
 
-    def fake_validate(patch_content):
-        return True, "Patch is correct", str(dummy_log), str(dummy_orig_log)
+    # Mock dependencies of evaluate_patch
+    # 1. task.validate is handled by DummyTask
+    # 2. get_logs_eval
+    mock_gold_sm = {"test1": TestStatus.FAILED.value, "test2": TestStatus.PASSED.value}
+    mock_eval_sm = {"test1": TestStatus.PASSED.value, "test2": TestStatus.PASSED.value} # All pass
 
-    monkeypatch.setattr(task, "validate", fake_validate)
-    monkeypatch.setattr(
-        validation, "perfect_angelic_debug", lambda tid, df, pp: (set(), set(), set())
-    )
-    monkeypatch.setattr(shutil, "move", lambda src, dst: None)
+    def mock_get_logs_eval_func(repo_name, log_file_path):
+        if "EMPTY" in Path(log_file_path).name: # Distinguish orig_log from eval_log
+            return mock_gold_sm, None
+        return mock_eval_sm, None
+    monkeypatch.setattr(validation, "get_logs_eval", mock_get_logs_eval_func)
 
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
+    # 3. (Optional) perfect_angelic_debug - for this test, assume it's not triggered or returns no issues
+    monkeypatch.setattr(validation, "perfect_angelic_debug", lambda tid, df, pp: (set(), set(), set()))
 
-    passed, msg = evaluate_patch(task, patch_handle, patch_content, str(output_dir))
+    passed, payload = evaluate_patch(task, patch_handle, patch_content, str(output_dir_path))
+
     assert passed is True
-    assert "successfully resolved" in msg
+    assert isinstance(payload, EvaluationPayload)
+    assert payload.status == ResolvedStatus.FULL # Because test1 FAILED->PASSED, test2 PASSED->PASSED
+    assert "ResolvedStatus: RESOLVED_FULL" in payload.message
+    assert payload.details is not None
+    if payload.details: # type guard
+        assert "test1" in payload.details[FAIL_TO_PASS]["success"]
+        assert "test2" in payload.details[PASS_TO_PASS]["success"]
+
+    # Restore original config values
+    config.enable_validation = original_enable_validation
+    config.enable_perfect_angelic = original_enable_perfect_angelic
+    config.enable_angelic = original_enable_angelic
+
+
+def test_evaluate_patch_p2p_na(monkeypatch, tmp_path):
+    config.enable_validation = True
+    config.enable_perfect_angelic = False
+    config.enable_angelic = False
+
+    task = DummyTask(repo_name="dummy/repo_p2p_na")
+    patch_handle = DummyPatchHandle()
+    patch_content = "p2p_na_patch"
+    output_dir_path = tmp_path / "output_p2p_na"
+    output_dir_path.mkdir()
+
+    mock_gold_sm = {"test_f2p": TestStatus.FAILED.value} # Only F2P tests
+    mock_eval_sm = {"test_f2p": TestStatus.PASSED.value}
+
+    def mock_get_logs_eval_func(repo_name, log_file_path):
+        if "EMPTY" in Path(log_file_path).name:
+            return mock_gold_sm, None
+        return mock_eval_sm, None
+    monkeypatch.setattr(validation, "get_logs_eval", mock_get_logs_eval_func)
+    monkeypatch.setattr(validation, "perfect_angelic_debug", lambda tid, df, pp: (set(), set(), set()))
+
+    passed, payload = evaluate_patch(task, patch_handle, patch_content, str(output_dir_path))
+
+    assert passed is True
+    assert isinstance(payload, EvaluationPayload)
+    assert payload.status == ResolvedStatus.FULL_P2P_NA
+    assert "ResolvedStatus: RESOLVED_FULL_P2P_NA" in payload.message
+
+
+def test_evaluate_patch_no_missing_results(monkeypatch, tmp_path):
+    config.enable_validation = True
+    task = DummyTask(repo_name="dummy/repo_missing")
+    patch_handle = DummyPatchHandle()
+    output_dir_path = tmp_path / "output_missing"
+    output_dir_path.mkdir()
+
+    # Gold: test_f2p should pass, test_p2p should pass
+    mock_gold_sm = {"test_f2p": TestStatus.FAILED.value, "test_p2p": TestStatus.PASSED.value}
+    # Eval: test_f2p is missing, test_p2p passes
+    mock_eval_sm = {"test_p2p": TestStatus.PASSED.value}
+
+    def mock_get_logs_eval_func(repo_name, log_file_path):
+        if "EMPTY" in Path(log_file_path).name: return mock_gold_sm, None
+        return mock_eval_sm, None # overall_status is None for eval run
+    monkeypatch.setattr(validation, "get_logs_eval", mock_get_logs_eval_func)
+    monkeypatch.setattr(validation, "perfect_angelic_debug", lambda tid, df, pp: (set(), set(), set()))
+
+    passed, payload = evaluate_patch(task, patch_handle, "patch_missing_results", str(output_dir_path))
+
+    assert passed is False # Because NO_MISSING_RESULTS is not a "pass" state
+    assert isinstance(payload, EvaluationPayload)
+    assert payload.status == ResolvedStatus.NO_MISSING_RESULTS
+    assert "ResolvedStatus: RESOLVED_NO_MISSING_RESULTS" in payload.message
+    assert "test_f2p" in payload.details[FAIL_TO_PASS]["missing"]
+
+
+def test_evaluate_patch_framework_error_in_eval(monkeypatch, tmp_path):
+    config.enable_validation = True
+    task = DummyTask(repo_name="dummy/repo_framework_error")
+    patch_handle = DummyPatchHandle()
+    output_dir_path = tmp_path / "output_framework_error"
+    output_dir_path.mkdir()
+
+    mock_gold_sm = {"test_f2p": TestStatus.FAILED.value}
+    # Eval: Simulates a framework error during the evaluation run
+    mock_eval_sm = {} # No results due to framework error
+
+    def mock_get_logs_eval_func(repo_name, log_file_path):
+        if "EMPTY" in Path(log_file_path).name: return mock_gold_sm, None
+        return mock_eval_sm, TestStatus.FRAMEWORK_ERROR # Eval run had a framework error
+    monkeypatch.setattr(validation, "get_logs_eval", mock_get_logs_eval_func)
+    monkeypatch.setattr(validation, "perfect_angelic_debug", lambda tid, df, pp: (set(), set(), set()))
+
+    passed, payload = evaluate_patch(task, patch_handle, "patch_framework_error", str(output_dir_path))
+
+    assert passed is False
+    assert isinstance(payload, EvaluationPayload)
+    assert payload.status == ResolvedStatus.NO_FRAMEWORK_ERROR
+    assert "ResolvedStatus: RESOLVED_NO_FRAMEWORK_ERROR" in payload.message

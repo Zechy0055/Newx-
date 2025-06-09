@@ -9,7 +9,7 @@ from typing import TypeAlias
 from loguru import logger
 from tenacity import retry, stop_after_attempt
 
-from app.agents.agent_common import InvalidLLMResponse
+from app.agents.agent_common import InvalidLLMResponse, LLMErrorCode
 from app.data_structures import MessageThread, ReproResult
 from app.log import print_acr, print_reproducer
 from app.model.gpt import common
@@ -65,6 +65,8 @@ class TestAgent:
         self._feedbacks: dict[TestHandle, list[str]] = defaultdict(list)
         self._history: list[TestHandle] = []
         self._non_repro_history: list[TestHandle] = []
+        self.task_id = task.get_instance_id()
+        self.bound_logger = logger.bind(task_id=self.task_id, agent="TestAgent")
 
     def write_reproducing_test_without_feedback(
         self, retries: int = 3
@@ -80,9 +82,11 @@ class TestAgent:
 
     def add_feedback(self, handle: TestHandle, feedback: str) -> None:
         if handle not in self._tests:
-            raise ValueError("patch {} does not exist", handle)
+            self.bound_logger.error("Attempted to add feedback to non-existent test handle: {}", handle)
+            raise ValueError(f"Test handle {handle} does not exist, cannot add feedback.")
 
         self._feedbacks[handle].append(feedback)
+        self.bound_logger.debug("Added feedback for test handle {}", handle)
 
     def _write_reproducing_test(
         self, num_feedbacks: int, retries: int
@@ -90,45 +94,67 @@ class TestAgent:
         reproducible, guard_thread = self._issue_has_reproduction_steps(
             self.task.get_issue_statement()
         )
-        guard_thread.save_to_file(Path(self.task_dir, "conv_reproducible.json"))
+        reproducible_conv_path = Path(self.task_dir, "conv_reproducible.json")
+        guard_thread.save_to_file(reproducible_conv_path)
+        self.bound_logger.debug("Saved reproducibility check conversation to {}", reproducible_conv_path)
         if not reproducible:
+            self.bound_logger.warning("Issue does not contain reproduction steps according to LLM check.")
             raise NoReproductionStep
 
-        for _ in range(retries):
+        for i in range(retries):
+            self.bound_logger.info("Attempt {}/{} to write reproducing test. Max feedbacks: {}", i + 1, retries, num_feedbacks)
             feedback_handles = self._select_feedback_handles(num_feedbacks)
+            self.bound_logger.debug("Selected feedback handles for this attempt: {}", feedback_handles)
 
             response, test_content, thread = self._write_test(feedback_handles)
             self._request_idx += 1
-            print_reproducer(response)
-            Path(self.task_dir, f"test_raw_{self._request_idx}.md").write_text(response)
-            thread.save_to_file(
-                Path(self.task_dir, f"conv_test_{self._request_idx}.json")
-            )
+
+            # print_reproducer already logs to JSON
+            print_reproducer(response, desc=f"attempt_{self._request_idx}")
+
+            raw_response_path = Path(self.task_dir, f"test_raw_{self._request_idx}.md")
+            raw_response_path.write_text(response)
+            self.bound_logger.debug("Saved raw test LLM response to {}", raw_response_path)
+
+            conv_path = Path(self.task_dir, f"conv_test_{self._request_idx}.json")
+            thread.save_to_file(conv_path)
+            self.bound_logger.debug("Saved test generation conversation to {}", conv_path)
 
             if test_content is None:
+                self.bound_logger.warning("Test content extraction failed for attempt {}.", self._request_idx)
                 continue
 
-            repro_result = self.task.execute_reproducer(test_content)
+            self.bound_logger.debug("Executing generated test content for attempt {}", self._request_idx)
+            repro_result = self.task.execute_reproducer(test_content) # Should log internally if necessary
 
-            print_acr(str(repro_result))
+            # print_acr already logs to JSON
+            print_acr(str(repro_result), desc=f"execution_attempt_{self._request_idx}")
 
             if repro_result.reproduced:
                 handle = self._register_reproducing_test(response, test_content)
+                self.bound_logger.info("Test successfully reproduced issue. Handle: {}, Request Index: {}", handle, self._request_idx)
                 return handle, test_content, repro_result
 
             handle = self._register_non_reproducing_test(
                 response, test_content, repro_result
             )
-            logger.info("registered non reproducing test {}", handle)
+            # logger.info already used, now with bound_logger
+            self.bound_logger.info("Registered non-reproducing test. Handle: {}, Request Index: {}", handle, self._request_idx)
 
         raise InvalidLLMResponse(
-            f"Failed to write a reproducing test in {retries} attempts"
+            message=f"Failed to write a reproducing test in {retries} attempts",
+            error_code=LLMErrorCode.OTHER,
+            detail="The agent could not produce a valid, reproducing test after multiple attempts and feedback cycles."
         )
 
     @classmethod
+    @classmethod # Class methods cannot use self.bound_logger directly
     def _issue_has_reproduction_steps(
         cls, issue_statement: str
     ) -> tuple[bool, MessageThread]:
+        # Use global logger or pass task_id if available and needed for context here
+        bound_class_logger = logger.bind(agent="TestAgent", method="_issue_has_reproduction_steps")
+        bound_class_logger.debug("Checking if issue statement has reproduction steps.")
         prefix_thread = MessageThread()
 
         prefix_thread.add_system(SYSTEM_PROMPT)
@@ -153,10 +179,23 @@ class TestAgent:
                 prefix_thread.to_msg(), response_format="json_object"
             )
 
-            result = json.loads(response)[key]
+            try:
+                result = json.loads(response)[key]
+            except (json.JSONDecodeError, KeyError) as e:
+                bound_class_logger.error("Failed to parse reproducibility check from LLM. Response: {}, Error: {}", response, e)
+                raise InvalidLLMResponse(
+                    message="Failed to parse reproducibility check from LLM response.",
+                    error_code=LLMErrorCode.BAD_FORMAT,
+                    detail=f"Response: {response}, Error: {e}"
+                )
 
             if not isinstance(result, bool):
-                raise InvalidLLMResponse
+                bound_class_logger.error("Unexpected format for reproducibility check. Expected bool for key '{}', got {}. Response: {}", key, type(result), response)
+                raise InvalidLLMResponse(
+                    message="Unexpected format for reproducibility check in LLM response.",
+                    error_code=LLMErrorCode.BAD_FORMAT,
+                    detail=f"Expected boolean for key '{key}', got {type(result)}. Response: {response}"
+                )
 
             thread = deepcopy(prefix_thread)
             thread.add_model(response)
@@ -187,17 +226,19 @@ class TestAgent:
             thread.add_user(INITIAL_REQUEST)
         for handle in history_handles:
             if feedbacks := self._feedbacks.get(handle, []):
-                thread.add_model(self._responses[handle], [])
-                for feedback in feedbacks:
-                    thread.add_user(feedback)
+                thread.add_model(self._responses[handle], []) # Assuming this is the LLM's previous response that generated the test
+                for feedback_text in feedbacks: # Renamed to feedback_text to avoid confusion
+                    thread.add_user(feedback_text)
             else:
-                logger.warning("test {} does not have a feedback; skipping", handle)
-        thread.add_user(INITIAL_REQUEST)
+                self.bound_logger.warning("Test handle {} does not have any feedback; skipping adding specific feedback for it.", handle)
+        thread.add_user(INITIAL_REQUEST) # Add the main prompt to generate/regenerate the test
 
-        if not history_handles:
-            print_acr(INITIAL_REQUEST)
+        if not history_handles: # If it's the very first attempt (no history)
+            # print_acr already logs to JSON
+            print_acr(INITIAL_REQUEST, desc=f"initial_prompt_request_{self._request_idx}")
 
-        response, *_ = common.SELECTED_MODEL.call(thread.to_msg())
+        self.bound_logger.debug("Calling LLM for test generation. History handles: {}", history_handles)
+        response, *_ = common.SELECTED_MODEL.call(thread.to_msg()) # LLM call
 
         return response, self.convert_response_to_test(response), thread
 
@@ -266,10 +307,12 @@ class TestAgent:
             return None
 
     def save_test(self, handle: TestHandle) -> None:
-        Path(self.task_dir, f"reproducer_{handle}.py").write_text(self._tests[handle])
+        file_path = Path(self.task_dir, f"reproducer_{handle}.py")
+        file_path.write_text(self._tests[handle])
+        self.bound_logger.debug("Saved test for handle {} to {}", handle, file_path)
 
 
-def generator(
+def generator( # This is a standalone generator, not part of TestAgent class
     issue_statement: str,
 ) -> Generator[tuple[str, MessageThread, bool], str | None, None]:
     prefix_thread = MessageThread()

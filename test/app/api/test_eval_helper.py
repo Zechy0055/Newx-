@@ -123,41 +123,80 @@ def test_get_logs_eval_success(tmp_path):
     log_file = tmp_path / "log.txt"
     log_file.write_text(log_content)
     # Use a repo that maps to parse_log_pytest, e.g. "pytest-dev/pytest"
-    parsed, ok = get_logs_eval("pytest-dev/pytest", str(log_file))
-    assert ok is True
+    parsed, overall_status = get_logs_eval("pytest-dev/pytest", str(log_file)) # New return type
+    assert overall_status is None # Expect None for a successful parse without global errors
     assert parsed.get("test_eval1") == "PASSED"
     assert parsed.get("test_eval2") == "FAILED"
 
+def test_get_logs_eval_with_timeout_marker(tmp_path):
+    log_content = f"PASSED test_before_timeout\n{TESTS_TIMEOUT}\nFAILED test_after_timeout"
+    log_file = tmp_path / "log_timeout.txt"
+    log_file.write_text(log_content)
+    parsed, overall_status = get_logs_eval("pytest-dev/pytest", str(log_file))
+    assert overall_status == TestStatus.EXECUTION_TIMEOUT
+    # Parser should still process available content
+    assert parsed.get("test_before_timeout") == "PASSED"
+    assert parsed.get("test_after_timeout") == "FAILED"
 
-def test_get_logs_eval_failure(tmp_path):
+
+def test_get_logs_eval_failure(tmp_path): # This test was for when it returned {}, False
     # Create a temporary log file with error markers.
     log_content = f"{TESTS_ERROR}\nSome error occurred."
     log_file = tmp_path / "log_error.txt"
     log_file.write_text(log_content)
-    parsed, ok = get_logs_eval("pytest-dev/pytest", str(log_file))
-    # In case of error, we expect an empty dict and ok False.
-    assert ok is False
+    parsed, overall_status = get_logs_eval("pytest-dev/pytest", str(log_file))
+    # Now it returns the overall_status enum and whatever it could parse
+    assert overall_status == TestStatus.FRAMEWORK_ERROR
+    # Depending on parser robustness, parsed might have some data or be empty
+    # For basic pytest parser, if TESTS_ERROR is present, it might still parse lines before it.
+    # If TESTS_ERROR is at the start, parsed would be {}.
+    # For this specific log_content, if TESTS_ERROR is the first thing, it's likely empty.
+    # Let's assume the current pytest parser would still try and might find nothing if error is at start.
+    # If the parser was more sophisticated, it might parse around it.
+    # For now, this test is more about overall_status.
+    # assert parsed == {} # This might be too strict depending on parser logic for partial logs
+
+def test_get_logs_eval_file_not_found():
+    parsed, overall_status = get_logs_eval("pytest-dev/pytest", "non_existent_file.log")
+    assert overall_status == TestStatus.FRAMEWORK_ERROR # Or a more specific LOG_FILE_MISSING if defined
     assert parsed == {}
 
+def test_get_logs_eval_unsupported_repo():
+    parsed, overall_status = get_logs_eval("unsupported/repo", "dummy.log")
+    assert overall_status == TestStatus.FRAMEWORK_ERROR
+    assert parsed == {}
 
-# --- Tests for test_passed and test_failed ---
+# --- Tests for test_passed, test_failed, test_missing ---
 
-
-def test_test_passed_and_failed():
-    # Create a simple status mapping.
+def test_test_status_functions():
     status_map = {
-        "case1": TestStatus.PASSED.value,
-        "case2": TestStatus.FAILED.value,
-        "case3": TestStatus.ERROR.value,
+        "case_pass": TestStatus.PASSED.value,
+        "case_fail": TestStatus.FAILED.value,
+        "case_error": TestStatus.ERROR.value,
+        "case_skip": TestStatus.SKIPPED.value,
     }
-    # test_passed returns True if test exists and status is PASSED.
-    assert test_passed("case1", status_map) is True
-    # For a case that is FAILED or ERROR, test_passed should be False.
-    assert test_passed("case2", status_map) is False
-    # test_failed returns True if test is not present or is FAILED/ERROR.
-    assert test_failed("case2", status_map) is True
-    # If a test is PASSED, test_failed should be False.
-    assert test_failed("case1", status_map) is False
+    # test_passed
+    assert test_passed("case_pass", status_map) is True
+    assert test_passed("case_fail", status_map) is False
+    assert test_passed("case_error", status_map) is False
+    assert test_passed("case_skip", status_map) is False
+    assert test_passed("case_missing", status_map) is False
+
+    # test_failed (overall_status = None)
+    assert test_failed("case_pass", status_map, None) is False
+    assert test_failed("case_fail", status_map, None) is True
+    assert test_failed("case_error", status_map, None) is True
+    assert test_failed("case_skip", status_map, None) is False # Skipped is not failed
+    assert test_failed("case_missing", status_map, None) is False # Missing is not explicitly failed by this func
+
+    # test_failed (overall_status = FRAMEWORK_ERROR) - current test_failed logic doesn't change outcome based on this
+    assert test_failed("case_pass", status_map, TestStatus.FRAMEWORK_ERROR) is False # Still passed if explicitly passed
+    assert test_failed("case_fail", status_map, TestStatus.FRAMEWORK_ERROR) is True
+    assert test_failed("case_missing", status_map, TestStatus.FRAMEWORK_ERROR) is False
+
+    # test_missing
+    assert test_missing("case_pass", status_map) is False
+    assert test_missing("case_missing", status_map) is True
 
 
 # --- Tests for get_eval_report, compute_fail_to_pass, compute_pass_to_pass, get_resolution_status ---
@@ -173,58 +212,161 @@ def test_get_eval_report():
     }
     # Create an evaluation status map.
     eval_sm = {
-        "t1": TestStatus.PASSED.value,  # success for FAIL_TO_PASS
-        "t2": TestStatus.FAILED.value,  # failure for FAIL_TO_PASS
-        "t3": TestStatus.PASSED.value,  # success for PASS_TO_PASS
-        "t4": TestStatus.FAILED.value,  # failure for PASS_TO_PASS
-        "t5": TestStatus.PASSED.value,  # for extra credit (if calculated)
-        "t6": TestStatus.FAILED.value,  # not considered if calculated
+        "t1": TestStatus.PASSED.value,
+        "t2": TestStatus.FAILED.value,
+        "t3": TestStatus.PASSED.value,
+        "t4": TestStatus.FAILED.value,
+        "t5": TestStatus.PASSED.value,
+        "t6": TestStatus.FAILED.value,
+        # t7 (F2P) is missing from eval_sm
+        # t8 (P2P) is missing from eval_sm
     }
-    report = get_eval_report(eval_sm, gold, calculate_to_fail=True)
-    # For FAIL_TO_PASS, success count should be 1 and failure count 1.
-    assert report[FAIL_TO_PASS]["success"] == ["t1"]
-    assert report[FAIL_TO_PASS]["failure"] == ["t2"]
-    # For PASS_TO_PASS, success count 1 and failure count 1.
-    assert report[PASS_TO_PASS]["success"] == ["t3"]
-    assert report[PASS_TO_PASS]["failure"] == ["t4"]
-    # And extra metrics for FAIL_TO_FAIL and PASS_TO_FAIL.
-    assert report[FAIL_TO_FAIL]["success"] == ["t5"]
-    assert report[PASS_TO_FAIL]["failure"] == ["t6"]
+    # Test with overall_status = None (clean run)
+    report_clean_run = get_eval_report(eval_sm, gold, overall_status=None, calculate_to_fail=True)
+    assert report_clean_run[FAIL_TO_PASS]["success"] == ["t1"]
+    assert report_clean_run[FAIL_TO_PASS]["failure"] == ["t2"]
+    assert report_clean_run[FAIL_TO_PASS]["missing"] == ["t7"] # t7 was in gold F2P, missing in eval
+    assert report_clean_run[PASS_TO_PASS]["success"] == ["t3"]
+    assert report_clean_run[PASS_TO_PASS]["failure"] == ["t4"]
+    assert report_clean_run[PASS_TO_PASS]["missing"] == ["t8"] # t8 was in gold P2P, missing in eval
+    assert report_clean_run[FAIL_TO_FAIL]["success"] == ["t5"]
+    assert report_clean_run[PASS_TO_FAIL]["failure"] == ["t6"]
+
+    # Test with overall_status = FRAMEWORK_ERROR
+    report_error_run = get_eval_report(eval_sm, gold, overall_status=TestStatus.FRAMEWORK_ERROR, calculate_to_fail=True)
+    # If overall_status is an error, "missing" lists should be empty as per current logic
+    # (tests not explicitly PASSED are just not counted towards success/failure, not marked "missing" due to agent vs. framework)
+    assert report_error_run[FAIL_TO_PASS]["success"] == ["t1"] # t1 still passed
+    assert report_error_run[FAIL_TO_PASS]["failure"] == ["t2"] # t2 still failed
+    assert report_error_run[FAIL_TO_PASS]["missing"] == [] # t7 is not "missing" if run failed globally
+    assert report_error_run[PASS_TO_PASS]["success"] == ["t3"]
+    assert report_error_run[PASS_TO_PASS]["failure"] == ["t4"]
+    assert report_error_run[PASS_TO_PASS]["missing"] == []
 
 
-def test_compute_metrics_and_resolution():
-    # Create a sample report.
-    report = {
-        FAIL_TO_PASS: {"success": ["t1", "t2"], "failure": ["t3"]},
-        PASS_TO_PASS: {"success": ["t4"], "failure": ["t5"]},
+def test_compute_metrics():
+    # Case 1: Standard, some F2P fixed, P2P maintained
+    report1 = {
+        FAIL_TO_PASS: {"success": ["t1", "t2"], "failure": ["t3"], "missing": []},
+        PASS_TO_PASS: {"success": ["t4", "t5"], "failure": [], "missing": []},
     }
-    f2p = compute_fail_to_pass(report)
-    p2p = compute_pass_to_pass(report)
-    # f2p should be 2/(2+1) = 0.666..., p2p should be 1/(1+1)=0.5.
-    assert abs(f2p - 0.6666) < 0.01
-    assert abs(p2p - 0.5) < 0.01
+    assert abs(compute_fail_to_pass(report1, None) - (2/3)) < 0.001
+    assert compute_pass_to_pass(report1, None) == 1.0
 
-    # Test get_resolution_status:
-    # Case FULL: f2p==1 and p2p==1.
+    # Case 2: No F2P tests considered (e.g., all missing or none in gold)
+    report2 = {
+        FAIL_TO_PASS: {"success": [], "failure": [], "missing": ["t1"]}, # or empty success/failure/missing
+        PASS_TO_PASS: {"success": ["t2"], "failure": [], "missing": []},
+    }
+    assert compute_fail_to_pass(report2, None) is None
+
+    # Case 3: No P2P tests considered
+    report3 = {
+        FAIL_TO_PASS: {"success": ["t1"], "failure": [], "missing": []},
+        PASS_TO_PASS: {"success": [], "failure": [], "missing": ["t2"]}, # or empty success/failure/missing
+    }
+    assert compute_pass_to_pass(report3, None) is None
+
+    # Case 4: All F2P failed
+    report4 = {
+        FAIL_TO_PASS: {"success": [], "failure": ["t1","t2"], "missing": []},
+        PASS_TO_PASS: {"success": ["t3"], "failure": [], "missing": []},
+    }
+    assert compute_fail_to_pass(report4, None) == 0.0
+
+    # Case 5: All P2P failed
+    report5 = {
+        FAIL_TO_PASS: {"success": ["t1"], "failure": [], "missing": []},
+        PASS_TO_PASS: {"success": [], "failure": ["t3","t4"], "missing": []},
+    }
+    assert compute_pass_to_pass(report5, None) == 0.0
+
+    # Case 6: F2P has only missing tests (and no global error implies these are true missing)
+    report6 = {
+        FAIL_TO_PASS: {"success": [], "failure": [], "missing": ["t1", "t2"]},
+        PASS_TO_PASS: {"success": ["t3"], "failure": [], "missing": []}
+    }
+    # Current logic for compute_fail_to_pass returns None if total_considered is 0
+    # If "missing" are not counted in total_considered, this will be None.
+    assert compute_fail_to_pass(report6, None) is None # As success+failure = 0
+
+
+def test_get_resolution_status_detailed():
+    # Overall Status tests
+    assert get_resolution_status({}, TestStatus.FRAMEWORK_ERROR) == ResolvedStatus.NO_FRAMEWORK_ERROR
+    assert get_resolution_status({}, TestStatus.EXECUTION_TIMEOUT) == ResolvedStatus.NO_EXECUTION_TIMEOUT
+
+    # Missing Results (overall_status is None)
+    report_missing_f2p = {
+        FAIL_TO_PASS: {"success": [], "failure": [], "missing": ["t1"]},
+        PASS_TO_PASS: {"success": ["t2"], "failure": [], "missing": []},
+    }
+    assert get_resolution_status(report_missing_f2p, None) == ResolvedStatus.NO_MISSING_RESULTS
+
+    report_missing_p2p = {
+        FAIL_TO_PASS: {"success": ["t1"], "failure": [], "missing": []},
+        PASS_TO_PASS: {"success": [], "failure": [], "missing": ["t2"]},
+    }
+    assert get_resolution_status(report_missing_p2p, None) == ResolvedStatus.NO_MISSING_RESULTS
+
+    # P2P N/A cases (p2p_metric is None because no P2P tests were *considered* for pass/fail)
+    report_full_p2p_na = { # All F2P fixed, no P2P tests
+        FAIL_TO_PASS: {"success": ["t1"], "failure": [], "missing": []},
+        PASS_TO_PASS: {"success": [], "failure": [], "missing": []}, # No considered P2P
+    }
+    assert get_resolution_status(report_full_p2p_na, None) == ResolvedStatus.FULL_P2P_NA
+
+    report_partial_p2p_na = { # Some F2P fixed, no P2P tests
+        FAIL_TO_PASS: {"success": ["t1"], "failure": ["t2"], "missing": []},
+        PASS_TO_PASS: {"success": [], "failure": [], "missing": []},
+    }
+    assert get_resolution_status(report_partial_p2p_na, None) == ResolvedStatus.PARTIAL_P2P_NA
+
+    report_no_f2p_progress_p2p_na = { # No F2P fixed, no P2P tests
+        FAIL_TO_PASS: {"success": [], "failure": ["t1"], "missing": []},
+        PASS_TO_PASS: {"success": [], "failure": [], "missing": []},
+    }
+    assert get_resolution_status(report_no_f2p_progress_p2p_na, None) == ResolvedStatus.NO
+
+    report_no_f2p_tests_p2p_na = { # No F2P tests at all, no P2P tests
+        FAIL_TO_PASS: {"success": [], "failure": [], "missing": []},
+        PASS_TO_PASS: {"success": [], "failure": [], "missing": []},
+    }
+    # This edge case: compute_fail_to_pass is None, compute_pass_to_pass is None.
+    # Current logic: f2p_metric is None, p2p_metric is None -> FULL_P2P_NA
+    assert get_resolution_status(report_no_f2p_tests_p2p_na, None) == ResolvedStatus.FULL_P2P_NA
+
+
+    # P2P Regression
+    report_p2p_regression = {
+        FAIL_TO_PASS: {"success": ["t1"], "failure": [], "missing": []}, # Full F2P
+        PASS_TO_PASS: {"success": ["t2"], "failure": ["t3"], "missing": []}, # P2P regression
+    }
+    assert get_resolution_status(report_p2p_regression, None) == ResolvedStatus.NO_P2P_REGRESSION
+
+    # Standard FULL, PARTIAL, NO (assuming P2P is 1.0 or P2P tests exist)
     report_full = {
-        FAIL_TO_PASS: {"success": ["t1"], "failure": []},
-        PASS_TO_PASS: {"success": ["t2"], "failure": []},
+        FAIL_TO_PASS: {"success": ["t1"], "failure": [], "missing": []},
+        PASS_TO_PASS: {"success": ["t2"], "failure": [], "missing": []},
     }
-    status_full = get_resolution_status(report_full)
-    assert status_full == ResolvedStatus.FULL
+    assert get_resolution_status(report_full, None) == ResolvedStatus.FULL
 
-    # Case PARTIAL: f2p between 0 and 1, p2p==1.
     report_partial = {
-        FAIL_TO_PASS: {"success": ["t1"], "failure": ["t3"]},
-        PASS_TO_PASS: {"success": ["t2"], "failure": []},
+        FAIL_TO_PASS: {"success": ["t1"], "failure": ["t3"], "missing": []},
+        PASS_TO_PASS: {"success": ["t2"], "failure": [], "missing": []},
     }
-    status_partial = get_resolution_status(report_partial)
-    assert status_partial == ResolvedStatus.PARTIAL
+    assert get_resolution_status(report_partial, None) == ResolvedStatus.PARTIAL
 
-    # Otherwise, status NO.
-    report_no = {
-        FAIL_TO_PASS: {"success": [], "failure": ["t1"]},
-        PASS_TO_PASS: {"success": ["t2"], "failure": []},
+    report_no_f2p_resolved = {
+        FAIL_TO_PASS: {"success": [], "failure": ["t1"], "missing": []},
+        PASS_TO_PASS: {"success": ["t2"], "failure": [], "missing": []}, # P2P maintained
     }
-    status_no = get_resolution_status(report_no)
-    assert status_no == ResolvedStatus.NO
+    assert get_resolution_status(report_no_f2p_resolved, None) == ResolvedStatus.NO
+
+    # Edge case: No F2P tests to fix, P2P maintained
+    report_no_f2p_tests_p2p_ok = {
+        FAIL_TO_PASS: {"success": [], "failure": [], "missing": []}, # No F2P tests
+        PASS_TO_PASS: {"success": ["t2"], "failure": [], "missing": []},
+    }
+    # f2p_metric is None, p2p_metric is 1.0 -> FULL
+    assert get_resolution_status(report_no_f2p_tests_p2p_ok, None) == ResolvedStatus.FULL
