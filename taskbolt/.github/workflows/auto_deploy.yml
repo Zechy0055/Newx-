@@ -1,0 +1,103 @@
+name: Taskbolt CI/CD - Build & Lint
+
+on:
+  push:
+    branches:
+      - main # Or your primary development branch
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-lint:
+    name: Build & Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- Frontend Steps ---
+      - name: Set up Node.js (for Frontend)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' # LTS version
+          cache: 'npm'
+          cache-dependency-path: taskbolt/frontend/package-lock.json
+
+      - name: Install Frontend Dependencies
+        working-directory: ./taskbolt/frontend # Correct path for frontend project
+        run: npm ci # Use ci for cleaner installs in CI
+
+      - name: Lint Frontend
+        working-directory: ./taskbolt/frontend
+        run: npm run lint # Assumes 'lint' script is in package.json (Next.js default)
+
+      - name: Build Frontend
+        working-directory: ./taskbolt/frontend
+        run: npm run build
+
+      # --- Backend Steps ---
+      - name: Set up Python (for Backend)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # Consistent with previous steps
+
+      - name: Install Python Build Tools & Dependencies (API)
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          if [ -f taskbolt/api/requirements.txt ]; then
+            pip install -r taskbolt/api/requirements.txt
+          else
+            echo "Error: taskbolt/api/requirements.txt not found!"
+            # The CI job will fail here if pip install returns non-zero due to missing file
+          fi
+
+      - name: Install Python Dependencies (Newx)
+        run: |
+          if [ -f taskbolt/newx/requirements.txt ]; then
+            pip install -r taskbolt/newx/requirements.txt
+          else
+            echo "Error: taskbolt/newx/requirements.txt not found!"
+            # The CI job will fail here if pip install returns non-zero
+          fi
+          # Add project root to PYTHONPATH for inter-module imports (e.g., taskbolt.newx from taskbolt.api)
+          echo "Adding ${{ github.workspace }} to PYTHONPATH"
+          echo "PYTHONPATH=${{ github.workspace }}:${PYTHONPATH}" >> $GITHUB_ENV
+
+      - name: Lint Backend with Flake8
+        env:
+          PYTHONPATH: ${{ github.workspace }} # Ensure PYTHONPATH is available for this step
+        run: |
+          echo "Linting taskbolt/api..."
+          flake8 taskbolt/api/
+          echo "Linting taskbolt/newx..."
+          flake8 taskbolt/newx/
+
+      # --- Placeholder Test Steps (to be implemented later) ---
+      - name: Run Frontend Tests (Placeholder)
+        if: false # Disabled for now
+        working-directory: ./taskbolt/frontend
+        run: npm test
+
+      - name: Run Backend Tests (Placeholder)
+        if: false # Disabled for now
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: echo "pytest taskbolt/api/tests/ taskbolt/newx/tests/ (placeholder)"
+
+  # --- Placeholder Deploy Job (to be implemented later) ---
+  deploy:
+    name: Deploy (Placeholder)
+    needs: build-and-lint
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && false # Disabled for now
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Vercel (Placeholder)
+        run: echo "Deploying frontend to Vercel (placeholder)..."
+
+      - name: Deploy to Railway (Placeholder)
+        run: echo "Deploying backend to Railway (placeholder)..."

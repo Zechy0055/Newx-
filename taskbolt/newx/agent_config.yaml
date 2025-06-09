@@ -1,0 +1,50 @@
+# Basic agent configuration
+agent_name: "TaskboltAI"
+version: "0.1.0"
+
+# AI Model Configuration
+# Supported models: gpt-4, gpt-3.5-turbo, qwen, etc.
+# Ensure API keys and access are configured environment for these models.
+model_provider: "openai" # or "custom_qwen", "anthropic"
+default_model: "gpt-4-0125-preview"
+temperature: 0.5
+max_tokens: 4000
+
+# Agent Roles & Capabilities (Example - to be expanded by LangGraph/CrewAI)
+roles:
+  - name: "Planner"
+    description: "Breaks down complex tasks into smaller steps."
+    tools: ["code_analyzer", "search_tool"]
+  - name: "Coder"
+    description: "Writes and modifies code based on plans."
+    tools: ["file_editor", "linter"]
+  - name: "Tester"
+    description: "Generates and runs tests to validate code changes."
+    tools: ["test_generator", "test_runner"]
+  - name: "Reviewer"
+    description: "Reviews code for quality, correctness, and adherence to standards."
+    tools: ["diff_viewer", "code_analyzer"]
+
+# Resource Limits
+max_iterations_per_task: 10
+max_execution_time_per_step_seconds: 300 # 5 minutes
+
+# Memory Configuration (Example - specific to chosen framework like LangGraph)
+memory:
+  type: "local" # or "redis", "database"
+  # Corrected path to be relative to project root or an absolute path if needed
+  path: "taskbolt/newx/agent_memory/" # if local, relative to where app is run or use absolute
+
+# Logging Configuration
+log_level: "INFO" # DEBUG, INFO, WARNING, ERROR
+# Corrected path
+log_file: "taskbolt/newx/logs/agent_activity.log"
+
+# GitHub Integration
+github_app_id: null # Fill if using GitHub App
+github_token_env_var: "GITHUB_TOKEN" # Environment variable for GitHub token
+
+# Deployment settings (placeholders)
+deployment_targets:
+  - "vercel"
+  - "railway"

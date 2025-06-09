@@ -1,0 +1,7 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+# PyYAML is not directly used by API routes but needed by imported task_orchestrator
+# If taskbolt.newx was an installable package, this wouldn't be explicitly needed here.
+PyYAML>=6.0
+
+flake8>=6.0.0
