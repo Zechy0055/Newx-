@@ -8,6 +8,7 @@ from app.model import (
     gptlitellm,
     groq,
     ollama,
+    qwen_model, # Added import for qwen_model
 )
 
 
@@ -69,6 +70,32 @@ def register_all_models() -> None:
 
     common.register_model(gemini.GeminiPro())
     common.register_model(gemini.Gemini15Pro())
+
+    # Register Qwen models via LiteLLM/TogetherAI
+    # Model names should match what LiteLLM expects for TogetherAI provider.
+    # Costs are placeholders and should be updated or dynamically fetched if possible.
+    # Using example Qwen model names available on TogetherAI.
+    # "qwen-turbo" might correspond to "qwen-1.8b-chat" or a similar smaller/faster model.
+    # "qwen-max" might correspond to "qwen-72b-chat" or "qwen1.5-72b-chat".
+
+    # Placeholder for "qwen-turbo" equivalent - using a smaller Qwen model from TogetherAI
+    common.register_model(qwen_model.QwenModel(
+        model_name="together_ai/qwen/qwen-1.8b-chat", # Example actual LiteLLM model string
+        cost_per_input=0.0,
+        cost_per_output=0.0
+    ))
+    # Placeholder for "qwen-max" equivalent - using a larger Qwen model from TogetherAI
+    common.register_model(qwen_model.QwenModel(
+        model_name="together_ai/qwen/qwen-72b-chat", # Example actual LiteLLM model string
+        cost_per_input=0.0,
+        cost_per_output=0.0
+    ))
+    # Example for a newer Qwen 1.5 model if available and named like this:
+    # common.register_model(qwen_model.QwenModel(
+    #     model_name="together_ai/Alibaba/qwen1.5-72b-chat",
+    #     cost_per_input=0.0,
+    #     cost_per_output=0.0
+    # ))
 
     # register default model as selected
     common.SELECTED_MODEL = gpt.Gpt35_Turbo0125()
